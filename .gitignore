@@ -2,8 +2,7 @@
 node_modules/
 
 # production build output
-# If you want to commit dist/ for deployment, remove this line.
-dist/
+# Note: dist/ is intentionally not ignored so built files can be deployed from Git.
 
 # local editor files
 .vscode/
