@@ -1,0 +1,16 @@
+# dependencies
+node_modules/
+
+# production build output
+# If you want to commit dist/ for deployment, remove this line.
+dist/
+
+# local editor files
+.vscode/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+
+# system files
+.DS_Store
