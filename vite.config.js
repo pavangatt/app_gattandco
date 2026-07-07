@@ -6,9 +6,16 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+        secure: false,
+      },
+    },
   },
   build: {
-    outDir: './', // This directs the build output to the root folder instead of /dist
-    emptyOutDir: false, // CRUCIAL: Prevents Vite from deleting your source files (like src/ or package.json) when rebuilding
+    outDir: 'dist',
+    emptyOutDir: true,
   },
 });

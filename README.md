@@ -21,15 +21,54 @@ npm install --legacy-peer-deps
 
 ## Run locally
 
+1. Install dependencies if you have not already:
+
+```bash
+npm install
+```
+
+2. Start the backend in one terminal:
+
+```bash
+set "NODE_ENV=development"
+node server.js
+```
+
+3. Start the frontend in another terminal:
+
 ```bash
 npm run dev
 ```
 
-Open the URL shown in the terminal, for example:
+4. Open the URL shown in the terminal, for example:
 
 ```text
-http://localhost:5174/
+http://localhost:5173/
 ```
+
+The frontend dev server proxies `/api` requests to `http://localhost:5000`, so the backend must be running for login/register to work.
+
+## Hostinger MySQL setup
+
+1. Confirm the Hostinger MySQL host name from your Hostinger control panel. It is usually a remote host like `mysqlXX.hostinger.com`, not `localhost`.
+2. Update `.env` with the correct host and port:
+
+```env
+DB_HOST=your-hostinger-mysql-host
+DB_PORT=3306
+DB_USER=u243439679_app
+DB_PASSWORD=!aw1@Mysql
+DB_NAME=u243439679_gattandco
+```
+
+3. Start the backend again:
+
+```bash
+set "NODE_ENV=development"
+node server.js
+```
+
+If the backend still fails, the error will tell us whether the host, port, or credentials are wrong.
 
 ## Build for production
 

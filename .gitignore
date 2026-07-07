@@ -4,12 +4,18 @@ node_modules/
 # production build output
 # Note: dist/ is intentionally not ignored so built files can be deployed from Git.
 
+# local environment
+.env
+
 # local editor files
 .vscode/
 
 # logs
 npm-debug.log*
 yarn-debug.log*
+server.log
+server-*.log
+request-activity.log
 
 # system files
 .DS_Store
