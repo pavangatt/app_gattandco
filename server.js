@@ -629,10 +629,20 @@ app.use((err, req, res, next) => {
   res.status(500).json({ message: 'Internal server error', error: err?.message || 'unknown' });
 });
 
-if (process.env.NODE_ENV !== 'development') {
-  app.use(express.static(path.resolve(process.cwd(), 'dist')));
+const distPath = path.resolve(process.cwd(), 'dist');
+if (fs.existsSync(distPath)) {
+  app.use(express.static(distPath));
+
+  app.get('/favicon.ico', (req, res) => {
+    const faviconPath = path.resolve(distPath, 'favicon.ico');
+    if (fs.existsSync(faviconPath)) {
+      return res.sendFile(faviconPath);
+    }
+    return res.status(204).end();
+  });
+
   app.use((req, res) => {
-    res.sendFile(path.resolve(process.cwd(), 'dist', 'index.html'));
+    res.sendFile(path.resolve(distPath, 'index.html'));
   });
 }
 
