@@ -641,12 +641,26 @@ if (fs.existsSync(distPath)) {
     return res.status(204).end();
   });
 
-  app.get('*', (req, res) => {
-    const ext = path.extname(req.path);
-    if (!ext && req.accepts('html')) {
-      return res.sendFile(path.resolve(distPath, 'index.html'));
+  app.get('/dist/*', (req, res) => {
+    const relativePath = req.path.replace(/^\/dist\//, '');
+    const filePath = path.resolve(distPath, relativePath);
+    if (fs.existsSync(filePath)) {
+      return res.sendFile(filePath);
     }
     return res.status(404).end();
+  });
+
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api/')) {
+      return res.status(404).json({ message: 'API route not found.' });
+    }
+
+    const ext = path.extname(req.path);
+    if (ext) {
+      return res.status(404).end();
+    }
+
+    return res.sendFile(path.resolve(distPath, 'index.html'));
   });
 } else {
   app.get('*', (req, res) => {
