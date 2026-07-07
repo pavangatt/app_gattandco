@@ -641,8 +641,9 @@ if (fs.existsSync(distPath)) {
     return res.status(204).end();
   });
 
-  app.get('/dist/*', (req, res) => {
-    const relativePath = req.path.replace(/^\/dist\//, '');
+  app.get(/^\/dist\/(.*)$/, (req, res) => {
+    const match = req.path.match(/^\/dist\/(.*)$/);
+    const relativePath = match && match[1] ? match[1] : '';
     const filePath = path.resolve(distPath, relativePath);
     if (fs.existsSync(filePath)) {
       return res.sendFile(filePath);
@@ -650,11 +651,7 @@ if (fs.existsSync(distPath)) {
     return res.status(404).end();
   });
 
-  app.get('*', (req, res) => {
-    if (req.path.startsWith('/api/')) {
-      return res.status(404).json({ message: 'API route not found.' });
-    }
-
+  app.get(/^(?!\/api\/).*$/, (req, res) => {
     const ext = path.extname(req.path);
     if (ext) {
       return res.status(404).end();
@@ -663,7 +660,7 @@ if (fs.existsSync(distPath)) {
     return res.sendFile(path.resolve(distPath, 'index.html'));
   });
 } else {
-  app.get('*', (req, res) => {
+  app.get(/.*/, (req, res) => {
     res.status(500).send('Build not found. Run npm run build before starting the server.');
   });
 }
