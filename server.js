@@ -631,7 +631,7 @@ app.use((err, req, res, next) => {
 
 const distPath = path.resolve(process.cwd(), 'dist');
 if (fs.existsSync(distPath)) {
-  app.use(express.static(distPath));
+  app.use(express.static(distPath, { index: false }));
 
   app.get('/favicon.ico', (req, res) => {
     const faviconPath = path.resolve(distPath, 'favicon.ico');
@@ -641,8 +641,16 @@ if (fs.existsSync(distPath)) {
     return res.status(204).end();
   });
 
-  app.use((req, res) => {
-    res.sendFile(path.resolve(distPath, 'index.html'));
+  app.get('*', (req, res) => {
+    const ext = path.extname(req.path);
+    if (!ext && req.accepts('html')) {
+      return res.sendFile(path.resolve(distPath, 'index.html'));
+    }
+    return res.status(404).end();
+  });
+} else {
+  app.get('*', (req, res) => {
+    res.status(500).send('Build not found. Run npm run build before starting the server.');
   });
 }
 
