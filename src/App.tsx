@@ -1269,7 +1269,7 @@ function App() {
       {buddyTab === 'location' && <div className="panel">
         <div className="inline-row">
           <h2>Current location</h2>
-          <button className="btn btn-secondary" onClick={refreshLocation} disabled={getActiveCaseVisits(visits).length === 0}>Refresh location</button>
+          <button className="btn btn-secondary" onClick={() => void refreshLocation()} disabled={getActiveCaseVisits(visits).length === 0}>Refresh location</button>
         </div>
         <p>{location ? `${location.lat}, ${location.lng} (updated ${new Date(location.updated_at).toLocaleTimeString()})` : 'Location not set yet.'}</p>
       </div>}
