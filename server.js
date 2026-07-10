@@ -1,8 +1,9 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import mysql from 'mysql2/promise';
+import { createClient } from '@supabase/supabase-js';
 import bcrypt from 'bcryptjs';
+import session from 'express-session';
 import path from 'path';
 import fs from 'fs';
 
@@ -12,88 +13,202 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-console.log('DB config:', {
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  user: process.env.DB_USER,
-  database: process.env.DB_NAME,
-});
+const sessionSecret = process.env.SESSION_SECRET || 'change-me-in-production';
+app.use(
+  session({
+    name: 'gatt_sid',
+    secret: sessionSecret,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 1000 * 60 * 60 * 8,
+    },
+  }),
+);
 
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3306,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseServiceRoleKey) {
+  console.error('Missing Supabase config. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env.');
+  process.exit(1);
+}
+
+if (supabaseServiceRoleKey.startsWith('sb_publishable_')) {
+  console.error('Invalid SUPABASE_SERVICE_ROLE_KEY. You provided a publishable key. Use the service_role key from Supabase Project Settings -> API.');
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+  },
 });
 
 const currentLocations = {};
 
 async function initDb() {
-  const connection = await pool.getConnection();
-  await connection.release();
+  const { error } = await supabase.from('users').select('id', { head: true, count: 'exact' });
+  if (error) {
+    throw error;
+  }
+}
+
+function throwIfError(error, context) {
+  if (error) {
+    const message = `${context}: ${error.message}`;
+    throw new Error(message);
+  }
+}
+
+async function fetchUsersMapById(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return {};
+  }
+
+  const deduped = Array.from(new Set(ids.filter((id) => Number.isFinite(Number(id))))).map((id) => Number(id));
+  if (deduped.length === 0) {
+    return {};
+  }
+
+  const { data, error } = await supabase.from('users').select('id, full_name, email, role, phone').in('id', deduped);
+  throwIfError(error, 'Unable to fetch users');
+
+  const map = {};
+  for (const user of data || []) {
+    map[user.id] = user;
+  }
+  return map;
+}
+
+async function fetchElderlyMapById(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return {};
+  }
+
+  const deduped = Array.from(new Set(ids.filter((id) => Number.isFinite(Number(id))))).map((id) => Number(id));
+  if (deduped.length === 0) {
+    return {};
+  }
+
+  const { data, error } = await supabase.from('elderly_members').select('id, client_id, full_name, age, address').in('id', deduped);
+  throwIfError(error, 'Unable to fetch elderly members');
+
+  const map = {};
+  for (const member of data || []) {
+    map[member.id] = member;
+  }
+  return map;
 }
 
 async function ensureElderlyMember(clientId, fullName) {
-  const [existing] = await pool.query('SELECT id FROM elderly_members WHERE client_id = ?', [clientId]);
+  const { data: existing, error: existingError } = await supabase
+    .from('elderly_members')
+    .select('id')
+    .eq('client_id', clientId)
+    .limit(1);
+  throwIfError(existingError, 'Unable to check elderly member');
+
   if (Array.isArray(existing) && existing.length > 0) {
     return;
   }
-  await pool.query(
-    'INSERT INTO elderly_members (client_id, full_name, age, medical_notes, address) VALUES (?, ?, ?, ?, ?)',
-    [clientId, fullName, 65, '', 'Unknown address'],
-  );
+
+  const { error } = await supabase
+    .from('elderly_members')
+    .insert({ client_id: clientId, full_name: fullName, age: 65, medical_notes: '', address: 'Unknown address' });
+  throwIfError(error, 'Unable to create elderly member');
 }
 
 async function ensureUser({ email, full_name, role, password, phone = '' }) {
-  const [rows] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
+  const { data: rows, error: rowsError } = await supabase.from('users').select('id').eq('email', email).limit(1);
+  throwIfError(rowsError, 'Unable to check existing user');
+
   if (Array.isArray(rows) && rows.length > 0) {
-    return;
+    return rows[0].id;
   }
+
   const hashedPassword = await bcrypt.hash(password, 10);
-  await pool.query(
-    'INSERT INTO users (full_name, email, phone, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-    [full_name, email, phone, hashedPassword, role, new Date()],
-  );
+
+  const { data: created, error: createError } = await supabase
+    .from('users')
+    .insert({ full_name, email, phone, password_hash: hashedPassword, role, created_at: new Date().toISOString() })
+    .select('id')
+    .single();
+  throwIfError(createError, 'Unable to create user');
+
+  const userId = created?.id;
   if (role === 'client') {
-    const [created] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
-    if (Array.isArray(created) && created.length > 0) {
-      await ensureElderlyMember(created[0].id, full_name);
+    if (userId) {
+      await ensureElderlyMember(userId, full_name);
     }
   }
+
+  return userId;
 }
 
 async function ensureAssignment(buddyId, elderlyId, options = {}) {
-  const [existing] = await pool.query('SELECT id FROM assignments WHERE buddy_id = ? AND elderly_id = ?', [buddyId, elderlyId]);
+  const { data: existing, error: existingError } = await supabase
+    .from('assignments')
+    .select('id')
+    .eq('buddy_id', buddyId)
+    .eq('elderly_id', elderlyId)
+    .limit(1);
+  throwIfError(existingError, 'Unable to check assignment');
+
   if (Array.isArray(existing) && existing.length > 0) {
     return;
   }
+
   const status = options.status || 'active';
-  await pool.query('INSERT INTO assignments (buddy_id, elderly_id, status) VALUES (?, ?, ?)', [buddyId, elderlyId, status]);
+  const { error: assignmentError } = await supabase.from('assignments').insert({ buddy_id: buddyId, elderly_id: elderlyId, status });
+  throwIfError(assignmentError, 'Unable to create assignment');
+
   const scheduledDate = options.scheduledDate || new Date().toISOString().slice(0, 10);
   const arrivalTime = options.arrivalTime || null;
   const departureTime = options.departureTime || null;
   const arrivalLatLng = options.arrivalLatLng || null;
   const statusCheck = options.statusCheck || (status === 'active' ? 'Good' : null);
   const buddyNotes = options.buddyNotes || `Assigned for ${options.term || 'short'} term`;
-  await pool.query(
-    'INSERT INTO visits (buddy_id, elderly_id, scheduled_date, arrival_time, departure_time, arrival_lat_lng, status_check, buddy_notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [buddyId, elderlyId, scheduledDate, arrivalTime, departureTime, arrivalLatLng, statusCheck, buddyNotes],
-  );
+
+  const { error: visitError } = await supabase.from('visits').insert({
+    buddy_id: buddyId,
+    elderly_id: elderlyId,
+    scheduled_date: scheduledDate,
+    arrival_time: arrivalTime,
+    departure_time: departureTime,
+    arrival_lat_lng: arrivalLatLng,
+    status_check: statusCheck,
+    buddy_notes: buddyNotes,
+  });
+  throwIfError(visitError, 'Unable to create visit');
 }
 
 async function ensureTask(visitId, taskName, status, measuredValue, buddyRemarks) {
-  const [existing] = await pool.query('SELECT id FROM visit_tasks WHERE visit_id = ? AND task_name = ?', [visitId, taskName]);
+  const { data: existing, error: existingError } = await supabase
+    .from('visit_tasks')
+    .select('id')
+    .eq('visit_id', visitId)
+    .eq('task_name', taskName)
+    .limit(1);
+  throwIfError(existingError, 'Unable to check task');
+
   if (Array.isArray(existing) && existing.length > 0) {
     return;
   }
-  await pool.query(
-    'INSERT INTO visit_tasks (visit_id, task_name, status, measured_value, buddy_remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-    [visitId, taskName, status, measuredValue || '', buddyRemarks || '', new Date()],
-  );
+
+  const { error } = await supabase.from('visit_tasks').insert({
+    visit_id: visitId,
+    task_name: taskName,
+    status,
+    measured_value: measuredValue || '',
+    buddy_remarks: buddyRemarks || '',
+    updated_at: new Date().toISOString(),
+  });
+  throwIfError(error, 'Unable to create task');
 }
 
 async function seedDefaultUsers() {
@@ -120,10 +235,21 @@ async function seedDefaultUsers() {
     });
   }
 
-  const [clientRows] = await pool.query('SELECT u.id, u.full_name, em.id AS elderly_id FROM users u LEFT JOIN elderly_members em ON em.client_id = u.id WHERE u.role = ?', ['client']);
-  const [buddyRows] = await pool.query('SELECT id, full_name FROM users WHERE role = ?', ['buddy']);
+  const { data: clientRows, error: clientError } = await supabase.from('users').select('id, full_name').eq('role', 'client');
+  throwIfError(clientError, 'Unable to load clients for seed');
+  const { data: elderlyRows, error: elderlyError } = await supabase.from('elderly_members').select('id, client_id');
+  throwIfError(elderlyError, 'Unable to load elderly members for seed');
+  const { data: buddyRows, error: buddyError } = await supabase.from('users').select('id, full_name').eq('role', 'buddy');
+  throwIfError(buddyError, 'Unable to load buddies for seed');
 
-  const clientMap = Array.isArray(clientRows) ? clientRows : [];
+  const elderlyByClient = {};
+  for (const member of elderlyRows || []) {
+    elderlyByClient[member.client_id] = member.id;
+  }
+
+  const clientMap = Array.isArray(clientRows)
+    ? clientRows.map((row) => ({ ...row, elderly_id: elderlyByClient[row.id] || null }))
+    : [];
   const buddyMap = Array.isArray(buddyRows) ? buddyRows : [];
 
   for (let index = 0; index < clientMap.length && index < buddyMap.length; index += 1) {
@@ -143,7 +269,8 @@ async function seedDefaultUsers() {
     });
   }
 
-  const [visitRows] = await pool.query('SELECT id, buddy_id, elderly_id FROM visits ORDER BY id ASC');
+  const { data: visitRows, error: visitError } = await supabase.from('visits').select('id, buddy_id, elderly_id').order('id', { ascending: true });
+  throwIfError(visitError, 'Unable to load visits for seed');
   if (Array.isArray(visitRows)) {
     const tasksData = [
       [
@@ -198,16 +325,31 @@ app.post('/api/register', async (req, res, next) => {
   }
 
   try {
-    const [rows] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
+    const { data: rows, error: rowsError } = await supabase.from('users').select('id').eq('email', email).limit(1);
+    throwIfError(rowsError, 'Unable to check email');
+
     if (Array.isArray(rows) && rows.length > 0) {
       return res.status(400).json({ message: 'Email is already registered.' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    await pool.query(
-      'INSERT INTO users (full_name, email, phone, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [name, email, phone || '', hashedPassword, 'client', new Date()],
-    );
+    const { data: created, error: createError } = await supabase
+      .from('users')
+      .insert({
+        full_name: name,
+        email,
+        phone: phone || '',
+        password_hash: hashedPassword,
+        role: 'client',
+        created_at: new Date().toISOString(),
+      })
+      .select('id')
+      .single();
+    throwIfError(createError, 'Unable to register user');
+
+    if (created?.id) {
+      await ensureElderlyMember(created.id, name);
+    }
 
     return res.json({ message: 'Registration successful. Admin will review your account request.' });
   } catch (error) {
@@ -226,10 +368,26 @@ app.post('/api/login', async (req, res) => {
   }
 
   try {
-    const [rows] = await pool.query(
-      'SELECT id, full_name, email, role, password_hash FROM users WHERE email = ? OR full_name = ? LIMIT 1',
-      [identifier, identifier],
-    );
+    let rows = [];
+    const { data: byEmail, error: byEmailError } = await supabase
+      .from('users')
+      .select('id, full_name, email, role, password_hash')
+      .eq('email', identifier)
+      .limit(1);
+    throwIfError(byEmailError, 'Unable to find user by email');
+
+    if (Array.isArray(byEmail) && byEmail.length > 0) {
+      rows = byEmail;
+    } else {
+      const { data: byName, error: byNameError } = await supabase
+        .from('users')
+        .select('id, full_name, email, role, password_hash')
+        .eq('full_name', identifier)
+        .limit(1);
+      throwIfError(byNameError, 'Unable to find user by name');
+      rows = Array.isArray(byName) ? byName : [];
+    }
+
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.status(401).json({ message: 'Invalid username or password.' });
     }
@@ -239,6 +397,8 @@ app.post('/api/login', async (req, res) => {
     if (!passwordMatch) {
       return res.status(401).json({ message: 'Invalid username or password.' });
     }
+
+    req.session.user = { id: user.id, name: user.full_name, email: user.email, role: user.role };
 
     return res.json({
       message: 'Login successful.',
@@ -250,15 +410,32 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+app.get('/api/session', (req, res) => {
+  if (!req.session.user) {
+    return res.status(401).json({ message: 'No active session.' });
+  }
+  return res.json({ user: req.session.user });
+});
+
+app.post('/api/logout', (req, res) => {
+  req.session.destroy((error) => {
+    if (error) {
+      return res.status(500).json({ message: 'Unable to logout.' });
+    }
+    res.clearCookie('gatt_sid');
+    return res.json({ message: 'Logout successful.' });
+  });
+});
+
 app.get('/api/users', async (req, res) => {
   const role = req.query.role;
   try {
-    const [rows] = await pool.query(
-      role && typeof role === 'string'
-        ? 'SELECT id, full_name, email, phone, role FROM users WHERE role = ? ORDER BY full_name'
-        : 'SELECT id, full_name, email, phone, role FROM users ORDER BY full_name',
-      role && typeof role === 'string' ? [role] : [],
-    );
+    let query = supabase.from('users').select('id, full_name, email, phone, role').order('full_name', { ascending: true });
+    if (role && typeof role === 'string') {
+      query = query.eq('role', role);
+    }
+    const { data: rows, error } = await query;
+    throwIfError(error, 'Unable to fetch users');
     return res.json(rows);
   } catch (error) {
     console.error('Fetch users failed:', error);
@@ -289,9 +466,14 @@ app.post('/api/users', async (req, res) => {
 
 app.get('/api/elderly-members', async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT em.id, em.client_id, em.full_name, em.age, em.address, u.email FROM elderly_members em LEFT JOIN users u ON em.client_id = u.id ORDER BY em.full_name',
-    );
+    const { data: members, error: membersError } = await supabase
+      .from('elderly_members')
+      .select('id, client_id, full_name, age, address')
+      .order('full_name', { ascending: true });
+    throwIfError(membersError, 'Unable to fetch elderly members');
+
+    const userMap = await fetchUsersMapById((members || []).map((item) => item.client_id));
+    const rows = (members || []).map((item) => ({ ...item, email: userMap[item.client_id]?.email || '' }));
     return res.json(rows);
   } catch (error) {
     console.error('Fetch elderly members failed:', error);
@@ -301,9 +483,23 @@ app.get('/api/elderly-members', async (req, res) => {
 
 app.get('/api/assignments', async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT a.id, a.buddy_id, a.elderly_id, a.status, u.full_name AS buddy_name, e.full_name AS elderly_name, e.age, e.address FROM assignments a LEFT JOIN users u ON a.buddy_id = u.id LEFT JOIN elderly_members e ON a.elderly_id = e.id ORDER BY a.id DESC',
-    );
+    const { data: assignments, error: assignmentsError } = await supabase
+      .from('assignments')
+      .select('id, buddy_id, elderly_id, status, term_type, admin_notes, end_date')
+      .order('id', { ascending: false });
+    throwIfError(assignmentsError, 'Unable to fetch assignments');
+
+    const userMap = await fetchUsersMapById((assignments || []).map((item) => item.buddy_id));
+    const elderlyMap = await fetchElderlyMapById((assignments || []).map((item) => item.elderly_id));
+
+    const rows = (assignments || []).map((assignment) => ({
+      ...assignment,
+      buddy_name: userMap[assignment.buddy_id]?.full_name || 'Unknown',
+      elderly_name: elderlyMap[assignment.elderly_id]?.full_name || 'Unknown',
+      age: elderlyMap[assignment.elderly_id]?.age ?? null,
+      address: elderlyMap[assignment.elderly_id]?.address ?? '',
+    }));
+
     return res.json(rows);
   } catch (error) {
     console.error('Fetch assignments failed:', error);
@@ -319,17 +515,21 @@ app.post('/api/assignments', async (req, res) => {
   }
 
   try {
-    const [assignmentResult] = await pool.query(
-      'INSERT INTO assignments (buddy_id, elderly_id, status) VALUES (?, ?, ?)',
-      [buddy_id, elderly_id, 'active'],
-    );
-    const assignmentId = assignmentResult.insertId;
+    const { data: assignmentResult, error: assignmentError } = await supabase
+      .from('assignments')
+      .insert({ buddy_id: Number(buddy_id), elderly_id: Number(elderly_id), status: 'active', term_type: term || 'short' })
+      .select('id')
+      .single();
+    throwIfError(assignmentError, 'Unable to create assignment');
+
+    const assignmentId = assignmentResult.id;
     const scheduledDate = new Date().toISOString().slice(0, 10);
     const note = term ? `Term: ${term}` : null;
-    await pool.query(
-      'INSERT INTO visits (buddy_id, elderly_id, scheduled_date, status_check, buddy_notes) VALUES (?, ?, ?, ?, ?)',
-      [buddy_id, elderly_id, scheduledDate, null, note],
-    );
+    const { error: visitError } = await supabase
+      .from('visits')
+      .insert({ buddy_id: Number(buddy_id), elderly_id: Number(elderly_id), scheduled_date: scheduledDate, visit_status: 'scheduled', status_check: null, buddy_notes: note });
+    throwIfError(visitError, 'Unable to create starter visit');
+
     return res.json({ message: 'Assignment created.', id: assignmentId });
   } catch (error) {
     console.error('Create assignment failed:', error);
@@ -342,20 +542,41 @@ app.get('/api/visits', async (req, res) => {
   const clientId = req.query.client_id;
 
   try {
-    let query =
-      'SELECT v.id, v.buddy_id, v.elderly_id, v.scheduled_date, v.arrival_time, v.departure_time, v.arrival_lat_lng, v.status_check, v.buddy_notes, u.full_name AS buddy_name, e.full_name AS client_name, e.age, e.address FROM visits v LEFT JOIN users u ON v.buddy_id = u.id LEFT JOIN elderly_members e ON v.elderly_id = e.id';
-    const params = [];
+    let visitQuery = supabase
+      .from('visits')
+      .select('id, buddy_id, elderly_id, scheduled_date, visit_status, arrival_time, departure_time, arrival_lat_lng, status_check, buddy_notes, client_visible_notes')
+      .order('scheduled_date', { ascending: false });
 
     if (buddyId) {
-      query += ' WHERE v.buddy_id = ?';
-      params.push(buddyId);
+      visitQuery = visitQuery.eq('buddy_id', Number(buddyId));
     } else if (clientId) {
-      query += ' WHERE e.client_id = ?';
-      params.push(clientId);
+      const { data: clientMembers, error: clientMembersError } = await supabase
+        .from('elderly_members')
+        .select('id')
+        .eq('client_id', Number(clientId));
+      throwIfError(clientMembersError, 'Unable to resolve client visits');
+
+      const memberIds = (clientMembers || []).map((item) => item.id);
+      if (memberIds.length === 0) {
+        return res.json([]);
+      }
+      visitQuery = visitQuery.in('elderly_id', memberIds);
     }
 
-    query += ' ORDER BY v.scheduled_date DESC';
-    const [rows] = await pool.query(query, params);
+    const { data: visits, error: visitsError } = await visitQuery;
+    throwIfError(visitsError, 'Unable to fetch visits');
+
+    const userMap = await fetchUsersMapById((visits || []).map((item) => item.buddy_id));
+    const elderlyMap = await fetchElderlyMapById((visits || []).map((item) => item.elderly_id));
+
+    const rows = (visits || []).map((visit) => ({
+      ...visit,
+      buddy_name: userMap[visit.buddy_id]?.full_name || 'Unknown',
+      client_name: elderlyMap[visit.elderly_id]?.full_name || 'Unknown',
+      age: elderlyMap[visit.elderly_id]?.age ?? null,
+      address: elderlyMap[visit.elderly_id]?.address ?? '',
+    }));
+
     return res.json(rows);
   } catch (error) {
     console.error('Fetch visits failed:', error);
@@ -365,7 +586,7 @@ app.get('/api/visits', async (req, res) => {
 
 app.put('/api/visits/:id', async (req, res) => {
   const visitId = req.params.id;
-  const { status_check, buddy_notes, arrival_time, departure_time, arrival_lat_lng } = req.body;
+  const { status_check, buddy_notes, arrival_time, departure_time, arrival_lat_lng, visit_status, client_visible_notes } = req.body;
 
   const updates = [];
   const values = [];
@@ -389,17 +610,59 @@ app.put('/api/visits/:id', async (req, res) => {
     updates.push('arrival_lat_lng = ?');
     values.push(arrival_lat_lng);
   }
+  if (visit_status !== undefined) {
+    updates.push('visit_status = ?');
+    values.push(visit_status);
+  }
+  if (client_visible_notes !== undefined) {
+    updates.push('client_visible_notes = ?');
+    values.push(client_visible_notes);
+  }
 
   if (updates.length === 0) {
     return res.status(400).json({ message: 'Nothing to update.' });
   }
 
   try {
-    await pool.query(`UPDATE visits SET ${updates.join(', ')} WHERE id = ?`, [...values, visitId]);
+    const payload = {};
+    if (status_check !== undefined) payload.status_check = status_check;
+    if (buddy_notes !== undefined) payload.buddy_notes = buddy_notes;
+    if (arrival_time !== undefined) payload.arrival_time = arrival_time;
+    if (departure_time !== undefined) payload.departure_time = departure_time;
+    if (arrival_lat_lng !== undefined) payload.arrival_lat_lng = arrival_lat_lng;
+    if (visit_status !== undefined) payload.visit_status = visit_status;
+    if (client_visible_notes !== undefined) payload.client_visible_notes = client_visible_notes;
+
+    const { error } = await supabase.from('visits').update(payload).eq('id', Number(visitId));
+    throwIfError(error, 'Unable to update visit');
+
     return res.json({ message: 'Visit updated.' });
   } catch (error) {
     console.error('Update visit failed:', error);
     return res.status(500).json({ message: 'Unable to update visit.' });
+  }
+});
+
+app.put('/api/assignments/:id', async (req, res) => {
+  const assignmentId = req.params.id;
+  const { status, term_type, end_date, admin_notes, buddy_id, elderly_id } = req.body;
+
+  try {
+    const payload = {};
+    if (status !== undefined) payload.status = status;
+    if (term_type !== undefined) payload.term_type = term_type;
+    if (end_date !== undefined) payload.end_date = end_date || null;
+    if (admin_notes !== undefined) payload.admin_notes = admin_notes;
+    if (buddy_id !== undefined) payload.buddy_id = Number(buddy_id);
+    if (elderly_id !== undefined) payload.elderly_id = Number(elderly_id);
+
+    const { error } = await supabase.from('assignments').update(payload).eq('id', Number(assignmentId));
+    throwIfError(error, 'Unable to update assignment');
+
+    return res.json({ message: 'Assignment updated.' });
+  } catch (error) {
+    console.error('Update assignment failed:', error);
+    return res.status(500).json({ message: 'Unable to update assignment.' });
   }
 });
 
@@ -408,20 +671,53 @@ app.get('/api/tasks', async (req, res) => {
   const clientId = req.query.client_id;
 
   try {
-    let query =
-      'SELECT t.id, t.visit_id, t.task_name, t.status, t.measured_value, t.buddy_remarks, t.updated_at, v.buddy_id, v.elderly_id, v.scheduled_date, u.full_name AS buddy_name, e.full_name AS client_name FROM visit_tasks t LEFT JOIN visits v ON t.visit_id = v.id LEFT JOIN users u ON v.buddy_id = u.id LEFT JOIN elderly_members e ON v.elderly_id = e.id';
-    const params = [];
+    const { data: allTasks, error: taskError } = await supabase
+      .from('visit_tasks')
+      .select('id, visit_id, task_name, status, measured_value, buddy_remarks, updated_at')
+      .order('updated_at', { ascending: false });
+    throwIfError(taskError, 'Unable to fetch tasks');
 
-    if (buddyId) {
-      query += ' WHERE v.buddy_id = ?';
-      params.push(buddyId);
-    } else if (clientId) {
-      query += ' WHERE e.client_id = ?';
-      params.push(clientId);
+    const visitIds = (allTasks || []).map((task) => task.visit_id);
+    if (visitIds.length === 0) {
+      return res.json([]);
     }
 
-    query += ' ORDER BY t.updated_at DESC';
-    const [rows] = await pool.query(query, params);
+    const { data: visitRows, error: visitError } = await supabase
+      .from('visits')
+      .select('id, buddy_id, elderly_id, scheduled_date')
+      .in('id', Array.from(new Set(visitIds)));
+    throwIfError(visitError, 'Unable to fetch visits for tasks');
+
+    const visitMap = {};
+    for (const visit of visitRows || []) {
+      visitMap[visit.id] = visit;
+    }
+
+    let rows = (allTasks || [])
+      .map((task) => ({ ...task, ...(visitMap[task.visit_id] || {}) }))
+      .filter((task) => !!task.visit_id && !!task.buddy_id && !!task.elderly_id);
+
+    if (buddyId) {
+      rows = rows.filter((task) => task.buddy_id === Number(buddyId));
+    } else if (clientId) {
+      const { data: clientMembers, error: clientMembersError } = await supabase
+        .from('elderly_members')
+        .select('id')
+        .eq('client_id', Number(clientId));
+      throwIfError(clientMembersError, 'Unable to resolve client tasks');
+      const memberSet = new Set((clientMembers || []).map((member) => member.id));
+      rows = rows.filter((task) => memberSet.has(task.elderly_id));
+    }
+
+    const userMap = await fetchUsersMapById(rows.map((item) => item.buddy_id));
+    const elderlyMap = await fetchElderlyMapById(rows.map((item) => item.elderly_id));
+
+    rows = rows.map((row) => ({
+      ...row,
+      buddy_name: userMap[row.buddy_id]?.full_name || 'Unknown',
+      client_name: elderlyMap[row.elderly_id]?.full_name || 'Unknown',
+    }));
+
     return res.json(rows);
   } catch (error) {
     console.error('Fetch tasks failed:', error);
@@ -436,10 +732,16 @@ app.post('/api/tasks', async (req, res) => {
   }
 
   try {
-    await pool.query(
-      'INSERT INTO visit_tasks (visit_id, task_name, status, measured_value, buddy_remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [visit_id, task_name, status || 'pending', measured_value || '', buddy_remarks || '', new Date()],
-    );
+    const { error } = await supabase.from('visit_tasks').insert({
+      visit_id,
+      task_name,
+      status: status || 'pending',
+      measured_value: measured_value || '',
+      buddy_remarks: buddy_remarks || '',
+      updated_at: new Date().toISOString(),
+    });
+    throwIfError(error, 'Unable to create task');
+
     return res.json({ message: 'Task created.' });
   } catch (error) {
     console.error('Create task failed:', error);
@@ -470,7 +772,14 @@ app.put('/api/tasks/:id', async (req, res) => {
   }
 
   try {
-    await pool.query(`UPDATE visit_tasks SET ${updates.join(', ')}, updated_at = ? WHERE id = ?`, [...values, new Date(), taskId]);
+    const payload = { updated_at: new Date().toISOString() };
+    if (status !== undefined) payload.status = status;
+    if (measured_value !== undefined) payload.measured_value = measured_value;
+    if (buddy_remarks !== undefined) payload.buddy_remarks = buddy_remarks;
+
+    const { error } = await supabase.from('visit_tasks').update(payload).eq('id', Number(taskId));
+    throwIfError(error, 'Unable to update task');
+
     return res.json({ message: 'Task updated.' });
   } catch (error) {
     console.error('Update task failed:', error);
@@ -490,10 +799,18 @@ app.post('/api/location', async (req, res) => {
   currentLocations[String(buddy_id)] = { lat, lng, updated_at: updatedAt };
 
   try {
-    const [rows] = await pool.query('SELECT id FROM visits WHERE buddy_id = ? ORDER BY scheduled_date DESC LIMIT 1', [buddy_id]);
+    const { data: rows, error: rowsError } = await supabase
+      .from('visits')
+      .select('id')
+      .eq('buddy_id', buddy_id)
+      .order('scheduled_date', { ascending: false })
+      .limit(1);
+    throwIfError(rowsError, 'Unable to fetch latest visit for location');
+
     if (Array.isArray(rows) && rows.length > 0) {
       const visitId = rows[0].id;
-      await pool.query('UPDATE visits SET arrival_lat_lng = ? WHERE id = ?', [arrivalLatLng, visitId]);
+      const { error: updateError } = await supabase.from('visits').update({ arrival_lat_lng: arrivalLatLng }).eq('id', visitId);
+      throwIfError(updateError, 'Unable to update visit location');
     }
   } catch (error) {
     console.error('Location update warning:', error);
@@ -515,7 +832,15 @@ app.get('/api/location', async (req, res) => {
   }
 
   try {
-    const [rows] = await pool.query('SELECT arrival_lat_lng FROM visits WHERE buddy_id = ? AND arrival_lat_lng IS NOT NULL ORDER BY scheduled_date DESC LIMIT 1', [buddyId]);
+    const { data: rows, error } = await supabase
+      .from('visits')
+      .select('arrival_lat_lng')
+      .eq('buddy_id', Number(buddyId))
+      .not('arrival_lat_lng', 'is', null)
+      .order('scheduled_date', { ascending: false })
+      .limit(1);
+    throwIfError(error, 'Unable to fetch location');
+
     if (Array.isArray(rows) && rows.length > 0) {
       const locationData = rows[0].arrival_lat_lng;
       if (locationData) {
@@ -531,15 +856,21 @@ app.get('/api/location', async (req, res) => {
 });
 
 app.post('/api/requests', async (req, res) => {
-  const { user_id, message, request_type } = req.body;
+  const { user_id, elderly_id, message, request_type } = req.body;
 
   if (!user_id || !message) {
     return res.status(400).json({ message: 'User ID and request message are required.' });
   }
 
   try {
-    const logEntry = `${new Date().toISOString()} | user_id=${user_id} | type=${request_type || 'general'} | message=${message}\n`;
-    fs.appendFileSync(path.resolve(process.cwd(), 'request-activity.log'), logEntry);
+    const { error } = await supabase.from('client_requests').insert({
+      user_id: Number(user_id),
+      elderly_id: elderly_id ? Number(elderly_id) : null,
+      request_type: request_type || 'general',
+      message,
+      status: 'open',
+    });
+    throwIfError(error, 'Unable to save request');
     return res.json({ message: 'Your request has been submitted. Admin will review it shortly.' });
   } catch (error) {
     console.error('Save request failed:', error);
@@ -556,31 +887,23 @@ app.get('/api/requests', async (req, res) => {
   }
 
   try {
-    const logPath = path.resolve(process.cwd(), 'request-activity.log');
-    if (!fs.existsSync(logPath)) {
-      return res.json([]);
+    let query = supabase
+      .from('client_requests')
+      .select('id, user_id, elderly_id, request_type, message, status, created_at, resolved_at')
+      .order('created_at', { ascending: false });
+
+    if (!all) {
+      query = query.eq('user_id', Number(userId));
     }
 
-    const content = fs.readFileSync(logPath, 'utf8');
-    const lines = content.split('\n').filter((line) => line.trim().length > 0);
-    const requests = lines.map((line) => {
-      const parts = line.split('|').map((part) => part.trim());
-      const timestamp = parts[0] || '';
-      const userPart = parts.find((part) => part.startsWith('user_id=')) || '';
-      const typePart = parts.find((part) => part.startsWith('type=')) || '';
-      const messagePart = parts.find((part) => part.startsWith('message=')) || '';
-      return {
-        timestamp,
-        user_id: Number(userPart.replace('user_id=', '') || 0),
-        request_type: typePart.replace('type=', ''),
-        message: messagePart.replace('message=', ''),
-      };
-    });
+    const { data: requests, error } = await query;
+    throwIfError(error, 'Unable to fetch requests');
 
-    const userIds = Array.from(new Set(requests.map((entry) => entry.user_id).filter((id) => id > 0)));
+    const userIds = Array.from(new Set((requests || []).map((entry) => entry.user_id).filter((id) => id > 0)));
     const userNames = {};
     if (userIds.length > 0) {
-      const [users] = await pool.query('SELECT id, full_name FROM users WHERE id IN (?)', [userIds]);
+      const { data: users, error: usersError } = await supabase.from('users').select('id, full_name').in('id', userIds);
+      throwIfError(usersError, 'Unable to fetch request user names');
       if (Array.isArray(users)) {
         users.forEach((row) => {
           userNames[row.id] = row.full_name;
@@ -588,14 +911,16 @@ app.get('/api/requests', async (req, res) => {
       }
     }
 
-    const enrichedRequests = requests.map((entry) => ({
-      ...entry,
+    const filteredRequests = (requests || []).map((entry) => ({
+      timestamp: entry.created_at,
+      user_id: entry.user_id,
       user_name: userNames[entry.user_id] || 'Unknown',
+      request_type: entry.request_type,
+      message: entry.message,
+      status: entry.status,
+      elderly_id: entry.elderly_id,
+      resolved_at: entry.resolved_at,
     }));
-
-    const filteredRequests = all
-      ? enrichedRequests
-      : enrichedRequests.filter((entry) => entry.user_id === Number(userId));
 
     return res.json(filteredRequests);
   } catch (error) {
@@ -605,16 +930,26 @@ app.get('/api/requests', async (req, res) => {
 });
 
 async function seedDefaultRequests() {
-  const logPath = path.resolve(process.cwd(), 'request-activity.log');
-  if (!fs.existsSync(logPath)) {
-    const defaultRequests = [
-      `${new Date().toISOString()} | user_id=2 | type=task_request | message=Request extra medication reminder for morning.`,
-      `${new Date(Date.now() - 3600000).toISOString()} | user_id=3 | type=feedback | message=Please ensure warm meals are available.`,
-      `${new Date(Date.now() - 7200000).toISOString()} | user_id=4 | type=special_care | message=Need extra assistance with mobility today.`,
-      `${new Date(Date.now() - 10800000).toISOString()} | user_id=5 | type=task_request | message=Add hydration checks every two hours.`,
-      `${new Date(Date.now() - 14400000).toISOString()} | user_id=6 | type=feedback | message=Buddy is doing a great job, thank you!`,
-    ];
-    fs.writeFileSync(logPath, defaultRequests.join('\n') + '\n', 'utf8');
+  const { data: existing, error: existingError } = await supabase.from('client_requests').select('id').limit(1);
+  throwIfError(existingError, 'Unable to inspect existing requests');
+  if (Array.isArray(existing) && existing.length > 0) {
+    return;
+  }
+
+  const { data: clients, error: clientsError } = await supabase.from('users').select('id').eq('role', 'client').order('id', { ascending: true });
+  throwIfError(clientsError, 'Unable to load clients for request seed');
+
+  const seedRequests = [
+    { user_id: clients?.[0]?.id, request_type: 'task_request', message: 'Request extra medication reminder for morning.' },
+    { user_id: clients?.[1]?.id, request_type: 'feedback', message: 'Please ensure warm meals are available.' },
+    { user_id: clients?.[2]?.id, request_type: 'special_care', message: 'Need extra assistance with mobility today.' },
+    { user_id: clients?.[3]?.id, request_type: 'task_request', message: 'Add hydration checks every two hours.' },
+    { user_id: clients?.[4]?.id, request_type: 'feedback', message: 'Buddy is doing a great job, thank you!' },
+  ].filter((entry) => entry.user_id);
+
+  if (seedRequests.length > 0) {
+    const { error } = await supabase.from('client_requests').insert(seedRequests);
+    throwIfError(error, 'Unable to seed requests');
   }
 }
 

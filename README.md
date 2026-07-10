@@ -48,27 +48,54 @@ http://localhost:5173/
 
 The frontend dev server proxies `/api` requests to `http://localhost:5000`, so the backend must be running for login/register to work.
 
-## Hostinger MySQL setup
+## Supabase setup
 
-1. Confirm the Hostinger MySQL host name from your Hostinger control panel. It is usually a remote host like `mysqlXX.hostinger.com`, not `localhost`.
-2. Update `.env` with the correct host and port:
+1. Create a Supabase project.
+2. In Supabase, go to Project Settings -> API and copy:
+- Project URL
+- service_role key
+3. Create `.env` from `.env.example` and set:
 
 ```env
-DB_HOST=your-hostinger-mysql-host
-DB_PORT=3306
-DB_USER=u243439679_app
-DB_PASSWORD=!aw1@Mysql
-DB_NAME=u243439679_gattandco
+SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=YOUR_SUPABASE_SERVICE_ROLE_KEY
+SESSION_SECRET=CHANGE_THIS_TO_A_LONG_RANDOM_SECRET
+PORT=5000
 ```
 
-3. Start the backend again:
+4. In Supabase SQL Editor, run the contents of [supabase-schema.sql](supabase-schema.sql).
+
+This schema includes:
+- Role-based users (`admin`, `buddy`, `client`)
+- Elderly profiles and client visibility mapping
+- Buddy-to-elderly assignments
+- Visit planning, arrival/departure tracking, and daily notes
+- Task tracking with carry-forward support
+- Location logs and structured status checks
+- Client request tracking
+
+5. Optional: if you plan to query Supabase directly from frontend clients, run [supabase-rls.sql](supabase-rls.sql) to enforce Row Level Security policies for Admin/Buddy/Client access.
+
+6. Optional demo seed data: run [supabase-seed.sql](supabase-seed.sql) in Supabase SQL Editor.
+
+This seeds:
+- 1 admin, 5 buddies, 20 clients
+- 20 elderly profiles
+- active assignments (round-robin buddy mapping)
+- 30 days of visits, tasks, status checks, and location logs
+- sample client requests
+
+Default seeded password: `1234567890`
+
+7. Start backend and frontend:
 
 ```bash
 set "NODE_ENV=development"
 node server.js
+npm run dev
 ```
 
-If the backend still fails, the error will tell us whether the host, port, or credentials are wrong.
+The backend now uses Supabase Postgres via `@supabase/supabase-js`.
 
 ## Build for production
 

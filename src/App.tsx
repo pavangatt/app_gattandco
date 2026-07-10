@@ -10,16 +10,27 @@ type User = {
   phone?: string;
 };
 
+type ApiUser = {
+  id: number;
+  name?: string;
+  full_name?: string;
+  email: string;
+  role: Role;
+  phone?: string;
+};
+
 type Visit = {
   id: number;
   buddy_id: number;
   elderly_id: number;
   scheduled_date: string;
+  visit_status?: string;
   arrival_time: string | null;
   departure_time: string | null;
   arrival_lat_lng: string | null;
   status_check: string | null;
   buddy_notes: string | null;
+  client_visible_notes?: string | null;
   buddy_name: string;
   client_name: string;
   age?: number;
@@ -51,6 +62,9 @@ type Assignment = {
   buddy_id: number;
   elderly_id: number;
   status: string;
+  term_type?: string;
+  admin_notes?: string | null;
+  end_date?: string | null;
   buddy_name: string;
   elderly_name: string;
   age?: number;
@@ -86,10 +100,15 @@ const initialAssignmentForm = {
 };
 
 const initialRequestForm = {
+  request_type: 'task_request' as 'task_request' | 'feedback' | 'special_care',
   message: '',
 };
 
 function App() {
+  type AdminTab = 'overview' | 'assignments' | 'visits' | 'tasks' | 'requests';
+  type ClientTab = 'visits' | 'tasks' | 'requests';
+  type BuddyTab = 'location' | 'visits' | 'tasks';
+
   const [user, setUser] = useState<User | null>(null);
   const [authForm, setAuthForm] = useState(initialAuthState);
   const [message, setMessage] = useState('');
@@ -106,17 +125,142 @@ function App() {
   const [createForm, setCreateForm] = useState(initialCreateForm);
   const [assignmentForm, setAssignmentForm] = useState(initialAssignmentForm);
   const [requestForm, setRequestForm] = useState(initialRequestForm);
+  const [assignmentEdits, setAssignmentEdits] = useState<Record<number, { status: string; term_type: string; admin_notes: string }>>({});
+  const [visitEdits, setVisitEdits] = useState<Record<number, { visit_status: string; status_check: string; buddy_notes: string; client_visible_notes: string }>>({});
+  const [adminTab, setAdminTab] = useState<AdminTab>('overview');
+  const [clientTab, setClientTab] = useState<ClientTab>('visits');
+  const [buddyTab, setBuddyTab] = useState<BuddyTab>('location');
+
+  const normalizeUser = (apiUser: ApiUser): User => ({
+    id: apiUser.id,
+    name: apiUser.name || apiUser.full_name || 'Unknown',
+    email: apiUser.email,
+    role: apiUser.role,
+    phone: apiUser.phone,
+  });
+
+  const CACHE_TTL_MS = 5 * 60 * 1000;
+
+  const getDashboardCacheKey = (activeUser: User) => `gatt_dashboard_${activeUser.role}_${activeUser.id}`;
+
+  useEffect(() => {
+    const cachedUserRaw = sessionStorage.getItem('gatt_user');
+    if (cachedUserRaw) {
+      try {
+        const cachedUser = JSON.parse(cachedUserRaw) as User;
+        setUser(cachedUser);
+      } catch {
+        sessionStorage.removeItem('gatt_user');
+      }
+    }
+
+    void (async () => {
+      try {
+        const response = await fetch('/api/session');
+        if (!response.ok) {
+          throw new Error('No active session');
+        }
+        const result = await response.json();
+        if (result?.user) {
+          setUser(result.user as User);
+          sessionStorage.setItem('gatt_user', JSON.stringify(result.user));
+        }
+      } catch {
+        setUser(null);
+        sessionStorage.removeItem('gatt_user');
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     if (!user) {
       return;
     }
-    loadDashboard();
-    if (user.role === 'buddy') {
-      refreshLocation();
-    }
+    void (async () => {
+      const visitData = await loadDashboard();
+      if (user.role === 'buddy') {
+        await refreshLocation(visitData);
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
+
+  useEffect(() => {
+    if (!user) {
+      return;
+    }
+
+    if (user.role === 'admin') {
+      const saved = localStorage.getItem('gatt_tab_admin');
+      if (saved && ['overview', 'assignments', 'visits', 'tasks', 'requests'].includes(saved)) {
+        setAdminTab(saved as AdminTab);
+      }
+    } else if (user.role === 'client') {
+      const saved = localStorage.getItem('gatt_tab_client');
+      if (saved && ['visits', 'tasks', 'requests'].includes(saved)) {
+        setClientTab(saved as ClientTab);
+      }
+    } else if (user.role === 'buddy') {
+      const saved = localStorage.getItem('gatt_tab_buddy');
+      if (saved && ['location', 'visits', 'tasks'].includes(saved)) {
+        setBuddyTab(saved as BuddyTab);
+      }
+    }
+  }, [user]);
+
+  useEffect(() => {
+    localStorage.setItem('gatt_tab_admin', adminTab);
+  }, [adminTab]);
+
+  useEffect(() => {
+    localStorage.setItem('gatt_tab_client', clientTab);
+  }, [clientTab]);
+
+  useEffect(() => {
+    localStorage.setItem('gatt_tab_buddy', buddyTab);
+  }, [buddyTab]);
+
+  useEffect(() => {
+    if (!user || user.role !== 'buddy') {
+      return;
+    }
+
+    if (getActiveCaseVisits(visits).length === 0) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshLocation();
+    }, 5 * 60 * 1000);
+
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, visits]);
+
+  useEffect(() => {
+    const nextAssignmentEdits: Record<number, { status: string; term_type: string; admin_notes: string }> = {};
+    assignments.forEach((assignment) => {
+      nextAssignmentEdits[assignment.id] = {
+        status: assignment.status || 'active',
+        term_type: assignment.term_type || 'short',
+        admin_notes: assignment.admin_notes || '',
+      };
+    });
+    setAssignmentEdits(nextAssignmentEdits);
+  }, [assignments]);
+
+  useEffect(() => {
+    const nextVisitEdits: Record<number, { visit_status: string; status_check: string; buddy_notes: string; client_visible_notes: string }> = {};
+    visits.forEach((visit) => {
+      nextVisitEdits[visit.id] = {
+        visit_status: visit.visit_status || 'scheduled',
+        status_check: visit.status_check || '',
+        buddy_notes: visit.buddy_notes || '',
+        client_visible_notes: visit.client_visible_notes || '',
+      };
+    });
+    setVisitEdits(nextVisitEdits);
+  }, [visits]);
 
   const handleChange = (field: keyof typeof authForm) => (event: React.ChangeEvent<HTMLInputElement>) => {
     setAuthForm({ ...authForm, [field]: event.target.value });
@@ -134,8 +278,65 @@ function App() {
     setRequestForm({ ...requestForm, message: event.target.value });
   };
 
+  const handleRequestTypeChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    setRequestForm({ ...requestForm, request_type: event.target.value as typeof initialRequestForm.request_type });
+  };
+
+  const getActiveCaseVisits = (visitList: Visit[]) => {
+    const today = new Date().toISOString().slice(0, 10);
+    return visitList.filter((visit) => {
+      const status = visit.visit_status || 'scheduled';
+      return visit.scheduled_date === today && (status === 'scheduled' || status === 'in_progress');
+    });
+  };
+
+  const getVisitActivityBadge = (visit: Visit) => {
+    const today = new Date().toISOString().slice(0, 10);
+    const status = visit.visit_status || 'scheduled';
+
+    if (visit.scheduled_date === today && (status === 'scheduled' || status === 'in_progress')) {
+      return { label: 'Active', className: 'pill badge-active' };
+    }
+
+    if (visit.scheduled_date === today) {
+      return { label: 'Today', className: 'pill badge-today' };
+    }
+
+    if (visit.scheduled_date > today) {
+      return { label: 'Up next', className: 'pill badge-upcoming' };
+    }
+
+    return { label: 'Past', className: 'pill badge-inactive' };
+  };
+
+  const handleAssignmentEditChange = (assignmentId: number, field: 'status' | 'term_type' | 'admin_notes', value: string) => {
+    setAssignmentEdits((current) => ({
+      ...current,
+      [assignmentId]: {
+        status: current[assignmentId]?.status || 'active',
+        term_type: current[assignmentId]?.term_type || 'short',
+        admin_notes: current[assignmentId]?.admin_notes || '',
+        [field]: value,
+      },
+    }));
+  };
+
+  const handleVisitEditChange = (visitId: number, field: 'visit_status' | 'status_check' | 'buddy_notes' | 'client_visible_notes', value: string) => {
+    setVisitEdits((current) => ({
+      ...current,
+      [visitId]: {
+        visit_status: current[visitId]?.visit_status || 'scheduled',
+        status_check: current[visitId]?.status_check || '',
+        buddy_notes: current[visitId]?.buddy_notes || '',
+        client_visible_notes: current[visitId]?.client_visible_notes || '',
+        [field]: value,
+      },
+    }));
+  };
+
   const loadBuddyLocations = async (visitList: Visit[]) => {
-    const buddyIds = Array.from(new Set(visitList.map((visit) => visit.buddy_id)));
+    const activeVisits = getActiveCaseVisits(visitList);
+    const buddyIds = Array.from(new Set(activeVisits.map((visit) => visit.buddy_id)));
     const locationMap: Record<number, { lat: string; lng: string; updated_at: string } | null> = {};
 
     await Promise.all(
@@ -159,7 +360,45 @@ function App() {
 
   const loadDashboard = async () => {
     if (!user) {
-      return;
+      return [] as Visit[];
+    }
+
+    const cacheKey = getDashboardCacheKey(user);
+    const cachedRaw = sessionStorage.getItem(cacheKey);
+    if (cachedRaw) {
+      try {
+        const cached = JSON.parse(cachedRaw) as {
+          ts: number;
+          buddies?: User[];
+          clients?: User[];
+          elderlyMembers?: ElderlyMember[];
+          assignments?: Assignment[];
+          visits?: Visit[];
+          tasks?: Task[];
+          requests?: RequestEntry[];
+        };
+
+        if (Date.now() - cached.ts < CACHE_TTL_MS) {
+          if (user.role === 'admin') {
+            setBuddies(cached.buddies || []);
+            setClients(cached.clients || []);
+            setElderlyMembers(cached.elderlyMembers || []);
+            setAssignments(cached.assignments || []);
+            setVisits(cached.visits || []);
+            setTasks(cached.tasks || []);
+            setRequests(cached.requests || []);
+          } else if (user.role === 'client') {
+            setVisits(cached.visits || []);
+            setTasks(cached.tasks || []);
+            setRequests(cached.requests || []);
+          } else if (user.role === 'buddy') {
+            setVisits(cached.visits || []);
+            setTasks(cached.tasks || []);
+          }
+        }
+      } catch {
+        sessionStorage.removeItem(cacheKey);
+      }
     }
 
     try {
@@ -174,26 +413,61 @@ function App() {
           fetch('/api/requests?all=true'),
         ]);
 
-        setBuddies(await buddyRes.json());
-        setClients(await clientRes.json());
-        setElderlyMembers(await elderlyRes.json());
-        setAssignments(await assignmentRes.json());
-        const visitData = await visitRes.json();
+        const buddyData = (await buddyRes.json()) as ApiUser[];
+        const clientData = (await clientRes.json()) as ApiUser[];
+        const elderlyData = (await elderlyRes.json()) as ElderlyMember[];
+        const assignmentData = (await assignmentRes.json()) as Assignment[];
+        const visitData = (await visitRes.json()) as Visit[];
+        const taskData = (await taskRes.json()) as Task[];
+        const requestData = (await requestRes.json()) as RequestEntry[];
+
+        setBuddies(buddyData.map(normalizeUser));
+        setClients(clientData.map(normalizeUser));
+        setElderlyMembers(elderlyData);
+        setAssignments(assignmentData);
         setVisits(visitData);
-        setTasks(await taskRes.json());
-        setRequests(await requestRes.json());
+        setTasks(taskData);
+        setRequests(requestData);
         await loadBuddyLocations(visitData);
+
+        sessionStorage.setItem(
+          cacheKey,
+          JSON.stringify({
+            ts: Date.now(),
+            buddies: buddyData.map(normalizeUser),
+            clients: clientData.map(normalizeUser),
+            elderlyMembers: elderlyData,
+            assignments: assignmentData,
+            visits: visitData,
+            tasks: taskData,
+            requests: requestData,
+          }),
+        );
+        return visitData;
       } else if (user.role === 'client') {
         const [visitRes, taskRes, requestRes] = await Promise.all([
           fetch(`/api/visits?client_id=${user.id}`),
           fetch(`/api/tasks?client_id=${user.id}`),
           fetch(`/api/requests?user_id=${user.id}`),
         ]);
-        const visitData = await visitRes.json();
+        const visitData = (await visitRes.json()) as Visit[];
+        const taskData = (await taskRes.json()) as Task[];
+        const requestData = (await requestRes.json()) as RequestEntry[];
         setVisits(visitData);
-        setTasks(await taskRes.json());
-        setRequests(await requestRes.json());
+        setTasks(taskData);
+        setRequests(requestData);
         await loadBuddyLocations(visitData);
+
+        sessionStorage.setItem(
+          cacheKey,
+          JSON.stringify({
+            ts: Date.now(),
+            visits: visitData,
+            tasks: taskData,
+            requests: requestData,
+          }),
+        );
+        return visitData;
       } else if (user.role === 'buddy') {
         const [visitRes, taskRes] = await Promise.all([
           fetch(`/api/visits?buddy_id=${user.id}`),
@@ -201,11 +475,24 @@ function App() {
         ]);
         const visitData = await visitRes.json();
         setVisits(visitData);
-        setTasks(await taskRes.json());
+        const taskData = await taskRes.json();
+        setTasks(taskData);
+
+        sessionStorage.setItem(
+          cacheKey,
+          JSON.stringify({
+            ts: Date.now(),
+            visits: visitData,
+            tasks: taskData,
+          }),
+        );
+        return visitData;
       }
     } catch (error) {
       setStatusMessage('Unable to load dashboard data.');
     }
+
+    return [] as Visit[];
   };
 
   const loadRequests = async (userId: number | null, all = false) => {
@@ -229,13 +516,18 @@ function App() {
       return;
     }
     if (user.role === 'admin' || user.role === 'client') {
-      await loadBuddyLocations(visits);
+      await loadBuddyLocations(getActiveCaseVisits(visits));
       setStatusMessage('Live locations refreshed.');
     }
   };
 
-  const refreshLocation = async () => {
+  const refreshLocation = async (visitList: Visit[] = visits) => {
     if (!user || user.role !== 'buddy') {
+      return;
+    }
+
+    if (getActiveCaseVisits(visitList).length === 0) {
+      setStatusMessage('Location updates are available only during an active case slot.');
       return;
     }
 
@@ -289,6 +581,7 @@ function App() {
         return;
       }
       setUser(result.user);
+      sessionStorage.setItem('gatt_user', JSON.stringify(result.user));
       setMessage('');
       setStatusMessage('');
       setAuthForm(initialAuthState);
@@ -298,7 +591,13 @@ function App() {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/logout', { method: 'POST' });
+    } catch {
+      // Ignore network errors while clearing local session state.
+    }
+
     setUser(null);
     setBuddies([]);
     setClients([]);
@@ -306,6 +605,10 @@ function App() {
     setVisits([]);
     setTasks([]);
     setLocation(null);
+    sessionStorage.removeItem('gatt_user');
+    Object.keys(sessionStorage)
+      .filter((key) => key.startsWith('gatt_dashboard_'))
+      .forEach((key) => sessionStorage.removeItem(key));
     setMessage('You have been logged out.');
     setStatusMessage('');
   };
@@ -406,6 +709,56 @@ function App() {
     }
   };
 
+  const handleAssignmentUpdate = async (assignmentId: number) => {
+    const draft = assignmentEdits[assignmentId];
+    if (!draft) {
+      return;
+    }
+
+    setStatusMessage('');
+    try {
+      const response = await fetch(`/api/assignments/${assignmentId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(draft),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        setStatusMessage(result.message || 'Unable to update assignment.');
+        return;
+      }
+      setStatusMessage(result.message);
+      await loadDashboard();
+    } catch (error) {
+      setStatusMessage('Unable to connect to the server.');
+    }
+  };
+
+  const handleVisitAdminUpdate = async (visitId: number) => {
+    const draft = visitEdits[visitId];
+    if (!draft) {
+      return;
+    }
+
+    setStatusMessage('');
+    try {
+      const response = await fetch(`/api/visits/${visitId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(draft),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        setStatusMessage(result.message || 'Unable to update visit.');
+        return;
+      }
+      setStatusMessage(result.message);
+      await loadDashboard();
+    } catch (error) {
+      setStatusMessage('Unable to connect to the server.');
+    }
+  };
+
   const handleRequestSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setStatusMessage('');
@@ -419,7 +772,7 @@ function App() {
       const response = await fetch('/api/requests', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: user.id, message: requestForm.message, request_type: 'client_request' }),
+        body: JSON.stringify({ user_id: user.id, message: requestForm.message, request_type: requestForm.request_type }),
       });
       const result = await response.json();
       if (!response.ok) {
@@ -465,6 +818,23 @@ function App() {
     </header>
   );
 
+  const renderDashboardTabs = (items: Array<{ key: string; label: string }>, active: string, onChange: (key: string) => void) => (
+    <div className="dashboard-tabs" role="tablist" aria-label="Dashboard sections">
+      {items.map((item) => (
+        <button
+          key={item.key}
+          type="button"
+          className={active === item.key ? 'active' : ''}
+          onClick={() => onChange(item.key)}
+          role="tab"
+          aria-selected={active === item.key}
+        >
+          {item.label}
+        </button>
+      ))}
+    </div>
+  );
+
   const adminDashboard = () => (
     <>
       <section className="hero">
@@ -476,7 +846,9 @@ function App() {
           </p>
         </div>
         <div className="hero-actions">
-          <button className="btn btn-secondary" onClick={refreshLiveLocations}>Refresh live locations</button>
+          <button className="btn btn-secondary" onClick={refreshLiveLocations} disabled={getActiveCaseVisits(visits).length === 0}>
+            Refresh live locations
+          </button>
         </div>
         <div className="hero-card">
           <div className="tiny">Quick stats</div>
@@ -489,7 +861,18 @@ function App() {
           </ul>
         </div>
       </section>
-      <div className="section">
+      {renderDashboardTabs(
+        [
+          { key: 'overview', label: 'Overview' },
+          { key: 'assignments', label: 'Assignments' },
+          { key: 'visits', label: 'Visits & Location' },
+          { key: 'tasks', label: 'Tasks' },
+          { key: 'requests', label: 'Requests' },
+        ],
+        adminTab,
+        (key) => setAdminTab(key as AdminTab),
+      )}
+      {adminTab === 'overview' && <div className="section">
         <div className="panel">
           <h2>Create caretaker or client login</h2>
           <form onSubmit={handleCreateUser} className="auth-form">
@@ -546,8 +929,8 @@ function App() {
             <button className="btn btn-primary auth-submit" type="submit">Create assignment</button>
           </form>
         </div>
-      </div>
-      <div className="section">
+      </div>}
+      {adminTab === 'overview' && <div className="section">
         <div className="panel">
           <h2>Caretaker directory</h2>
           <div className="card-grid">{buddies.map(createUserCard)}</div>
@@ -556,8 +939,8 @@ function App() {
           <h2>Client directory</h2>
           <div className="card-grid">{clients.map(createUserCard)}</div>
         </div>
-      </div>
-      <div className="panel">
+      </div>}
+      {adminTab === 'assignments' && <div className="panel">
         <h2>Current assignments</h2>
         <table className="panel-table">
           <thead>
@@ -565,7 +948,9 @@ function App() {
               <th>Caretaker</th>
               <th>Client</th>
               <th>Status</th>
-              <th>Notes</th>
+              <th>Term</th>
+              <th>Admin notes</th>
+              <th>Save</th>
             </tr>
           </thead>
           <tbody>
@@ -573,14 +958,37 @@ function App() {
               <tr key={assignment.id}>
                 <td>{assignment.buddy_name || 'Unknown'}</td>
                 <td>{assignment.elderly_name || 'Unknown'}</td>
-                <td>{assignment.status}</td>
-                <td>{assignment.address || '—'}</td>
+                <td>
+                  <select className="small-input" value={assignmentEdits[assignment.id]?.status || assignment.status} onChange={(event) => handleAssignmentEditChange(assignment.id, 'status', event.target.value)}>
+                    <option value="active">active</option>
+                    <option value="paused">paused</option>
+                    <option value="completed">completed</option>
+                    <option value="cancelled">cancelled</option>
+                  </select>
+                </td>
+                <td>
+                  <select className="small-input" value={assignmentEdits[assignment.id]?.term_type || assignment.term_type || 'short'} onChange={(event) => handleAssignmentEditChange(assignment.id, 'term_type', event.target.value)}>
+                    <option value="short">short</option>
+                    <option value="long">long</option>
+                  </select>
+                </td>
+                <td>
+                  <input
+                    className="small-input"
+                    value={assignmentEdits[assignment.id]?.admin_notes || ''}
+                    onChange={(event) => handleAssignmentEditChange(assignment.id, 'admin_notes', event.target.value)}
+                    placeholder={assignment.address || 'Add note'}
+                  />
+                </td>
+                <td>
+                  <button className="btn btn-secondary" type="button" onClick={() => handleAssignmentUpdate(assignment.id)}>Save</button>
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
-      </div>
-      <div className="panel">
+      </div>}
+      {adminTab === 'requests' && <div className="panel">
         <h2>Client requests</h2>
         <table className="panel-table">
           <thead>
@@ -602,8 +1010,8 @@ function App() {
             ))}
           </tbody>
         </table>
-      </div>
-      <div className="panel">
+      </div>}
+      {adminTab === 'visits' && <div className="panel">
         <h2>Active visits and location</h2>
         <table className="panel-table">
           <thead>
@@ -611,10 +1019,14 @@ function App() {
               <th>Caregiver</th>
               <th>Client</th>
               <th>Scheduled</th>
+              <th>Case state</th>
               <th>Start</th>
+              <th>End</th>
               <th>Location</th>
               <th>Status</th>
               <th>Notes</th>
+              <th>Visit state</th>
+              <th>Save</th>
             </tr>
           </thead>
           <tbody>
@@ -623,23 +1035,40 @@ function App() {
               const displayLocation = liveLocation
                 ? `${liveLocation.lat}, ${liveLocation.lng} (live)`
                 : visit.arrival_lat_lng || 'Unknown';
+              const activityBadge = getVisitActivityBadge(visit);
 
               return (
                 <tr key={visit.id}>
                   <td>{visit.buddy_name}</td>
                   <td>{visit.client_name}</td>
                   <td>{visit.scheduled_date}</td>
+                  <td><span className={activityBadge.className}>{activityBadge.label}</span></td>
                   <td>{visit.arrival_time || 'Pending'}</td>
+                  <td>{visit.departure_time || 'Pending'}</td>
                   <td>{displayLocation}</td>
-                  <td>{visit.status_check || 'Pending'}</td>
+                  <td>
+                    <input className="small-input" value={visitEdits[visit.id]?.status_check || ''} onChange={(event) => handleVisitEditChange(visit.id, 'status_check', event.target.value)} placeholder="Status check" />
+                  </td>
                   <td>{visit.buddy_notes || 'No notes'}</td>
+                  <td>
+                    <select className="small-input" value={visitEdits[visit.id]?.visit_status || visit.visit_status || 'scheduled'} onChange={(event) => handleVisitEditChange(visit.id, 'visit_status', event.target.value)}>
+                      <option value="scheduled">scheduled</option>
+                      <option value="in_progress">in_progress</option>
+                      <option value="completed">completed</option>
+                      <option value="missed">missed</option>
+                      <option value="cancelled">cancelled</option>
+                    </select>
+                  </td>
+                  <td>
+                    <button className="btn btn-secondary" type="button" onClick={() => handleVisitAdminUpdate(visit.id)}>Save</button>
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
-      </div>
-      <div className="panel">
+      </div>}
+      {adminTab === 'tasks' && <div className="panel">
         <h2>Upcoming task status</h2>
         <table className="panel-table">
           <thead>
@@ -669,7 +1098,7 @@ function App() {
             ))}
           </tbody>
         </table>
-      </div>
+      </div>}
       {statusMessage && <div className="auth-message">{statusMessage}</div>}
     </>
   );
@@ -685,7 +1114,7 @@ function App() {
           </p>
         </div>
         <div className="hero-actions">
-          <button className="btn btn-secondary" onClick={refreshLiveLocations}>Refresh live locations</button>
+          <button className="btn btn-secondary" onClick={refreshLiveLocations} disabled={getActiveCaseVisits(visits).length === 0}>Refresh live locations</button>
         </div>
         <div className="hero-card">
           <div className="tiny">Logged in as</div>
@@ -698,7 +1127,16 @@ function App() {
           </ul>
         </div>
       </section>
-      <div className="panel">
+      {renderDashboardTabs(
+        [
+          { key: 'visits', label: 'Visits' },
+          { key: 'tasks', label: 'Tasks' },
+          { key: 'requests', label: 'Requests' },
+        ],
+        clientTab,
+        (key) => setClientTab(key as ClientTab),
+      )}
+      {clientTab === 'visits' && <div className="panel">
         <h2>Current visits</h2>
         <table className="panel-table">
           <thead>
@@ -729,8 +1167,8 @@ function App() {
             })}
           </tbody>
         </table>
-      </div>
-      <div className="panel">
+      </div>}
+      {clientTab === 'tasks' && <div className="panel">
         <h2>Assigned tasks</h2>
         <table className="panel-table">
           <thead>
@@ -752,18 +1190,26 @@ function App() {
             ))}
           </tbody>
         </table>
-      </div>
-      <div className="panel">
+      </div>}
+      {clientTab === 'requests' && <div className="panel">
         <h2>Request feedback or special care</h2>
         <form onSubmit={handleRequestSubmit} className="auth-form">
+          <label>
+            Request type
+            <select className="small-input" value={requestForm.request_type} onChange={handleRequestTypeChange}>
+              <option value="task_request">Task request</option>
+              <option value="feedback">Feedback</option>
+              <option value="special_care">Special care</option>
+            </select>
+          </label>
           <label>
             Request details
             <textarea className="small-input" value={requestForm.message} onChange={handleRequestChange} rows={4} placeholder="Describe an additional task, feedback, or special care note." />
           </label>
           <button className="btn btn-primary auth-submit" type="submit">Send request</button>
         </form>
-      </div>
-      <div className="panel">
+      </div>}
+      {clientTab === 'requests' && <div className="panel">
         <h2>My request history</h2>
         <table className="panel-table">
           <thead>
@@ -785,7 +1231,7 @@ function App() {
             ))}
           </tbody>
         </table>
-      </div>
+      </div>}
       {statusMessage && <div className="auth-message">{statusMessage}</div>}
     </>
   );
@@ -806,44 +1252,58 @@ function App() {
           <div>Email: {user?.email}</div>
           <ul>
             <li>Update task progress directly</li>
-            <li>Refresh location when you begin work</li>
+            <li>Refresh location when you begin work or refresh the page</li>
             <li>Track visit status and start time</li>
           </ul>
         </div>
       </section>
-      <div className="panel">
+      {renderDashboardTabs(
+        [
+          { key: 'location', label: 'Location' },
+          { key: 'visits', label: 'Visits' },
+          { key: 'tasks', label: 'Tasks' },
+        ],
+        buddyTab,
+        (key) => setBuddyTab(key as BuddyTab),
+      )}
+      {buddyTab === 'location' && <div className="panel">
         <div className="inline-row">
           <h2>Current location</h2>
-          <button className="btn btn-secondary" onClick={refreshLocation}>Refresh location</button>
+          <button className="btn btn-secondary" onClick={refreshLocation} disabled={getActiveCaseVisits(visits).length === 0}>Refresh location</button>
         </div>
         <p>{location ? `${location.lat}, ${location.lng} (updated ${new Date(location.updated_at).toLocaleTimeString()})` : 'Location not set yet.'}</p>
-      </div>
-      <div className="panel">
+      </div>}
+      {buddyTab === 'visits' && <div className="panel">
         <h2>Visits</h2>
         <table className="panel-table">
           <thead>
             <tr>
               <th>Client</th>
               <th>Scheduled</th>
+              <th>Case state</th>
               <th>Arrival</th>
               <th>Status</th>
               <th>Notes</th>
             </tr>
           </thead>
           <tbody>
-            {visits.map((visit) => (
-              <tr key={visit.id}>
-                <td>{visit.client_name}</td>
-                <td>{visit.scheduled_date}</td>
-                <td>{visit.arrival_time || 'Pending'}</td>
-                <td>{visit.status_check || 'Pending'}</td>
-                <td>{visit.buddy_notes || 'None'}</td>
-              </tr>
-            ))}
+            {visits.map((visit) => {
+              const activityBadge = getVisitActivityBadge(visit);
+              return (
+                <tr key={visit.id}>
+                  <td>{visit.client_name}</td>
+                  <td>{visit.scheduled_date}</td>
+                  <td><span className={activityBadge.className}>{activityBadge.label}</span></td>
+                  <td>{visit.arrival_time || 'Pending'}</td>
+                  <td>{visit.status_check || 'Pending'}</td>
+                  <td>{visit.buddy_notes || 'None'}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
-      </div>
-      <div className="panel">
+      </div>}
+      {buddyTab === 'tasks' && <div className="panel">
         <h2>My tasks</h2>
         <table className="panel-table">
           <thead>
@@ -871,7 +1331,7 @@ function App() {
             ))}
           </tbody>
         </table>
-      </div>
+      </div>}
       {statusMessage && <div className="auth-message">{statusMessage}</div>}
     </>
   );

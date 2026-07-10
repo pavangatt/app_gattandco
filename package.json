@@ -11,13 +11,15 @@
     "start": "npm run build && node server.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.110.2",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "mysql2": "^3.22.5",
+    "express-session": "^1.19.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "tslib": "^2.8.1"
   },
   "devDependencies": {
     "@types/react": "^19.2.17",
