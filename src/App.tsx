@@ -8,6 +8,7 @@ type User = {
   email: string;
   role: Role;
   phone?: string;
+  address?: string;
 };
 
 type ApiUser = {
@@ -17,6 +18,7 @@ type ApiUser = {
   email: string;
   role: Role;
   phone?: string;
+  address?: string;
 };
 
 type Visit = {
@@ -106,7 +108,7 @@ const initialRequestForm = {
 };
 
 function App() {
-  type AdminTab = 'overview' | 'assignments' | 'visits' | 'tasks' | 'requests';
+  type AdminTab = 'overview' | 'buddy-directory' | 'client-directory' | 'assignments' | 'visits' | 'tasks' | 'requests';
   type ClientTab = 'visits' | 'tasks' | 'requests';
   type BuddyTab = 'location' | 'visits' | 'tasks';
 
@@ -128,6 +130,10 @@ function App() {
   const [requestForm, setRequestForm] = useState(initialRequestForm);
   const [assignmentEdits, setAssignmentEdits] = useState<Record<number, { status: string; term_type: string; admin_notes: string }>>({});
   const [visitEdits, setVisitEdits] = useState<Record<number, { visit_status: string; status_check: string; buddy_notes: string; client_visible_notes: string }>>({});
+  const [directorySearch, setDirectorySearch] = useState({ buddy: '', client: '' });
+  const [directorySort, setDirectorySort] = useState<{ buddy: 'name' | 'email'; client: 'name' | 'email' }>({ buddy: 'name', client: 'name' });
+  const [selectedAssignmentBuddyId, setSelectedAssignmentBuddyId] = useState('');
+  const [selectedVisitClientId, setSelectedVisitClientId] = useState('');
   const [adminTab, setAdminTab] = useState<AdminTab>('overview');
   const [clientTab, setClientTab] = useState<ClientTab>('visits');
   const [buddyTab, setBuddyTab] = useState<BuddyTab>('location');
@@ -138,6 +144,7 @@ function App() {
     email: apiUser.email,
     role: apiUser.role,
     phone: apiUser.phone,
+    address: apiUser.address,
   });
 
   const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -193,7 +200,7 @@ function App() {
 
     if (user.role === 'admin') {
       const saved = localStorage.getItem('gatt_tab_admin');
-      if (saved && ['overview', 'assignments', 'visits', 'tasks', 'requests'].includes(saved)) {
+      if (saved && ['overview', 'buddy-directory', 'client-directory', 'assignments', 'visits', 'tasks', 'requests'].includes(saved)) {
         setAdminTab(saved as AdminTab);
       }
     } else if (user.role === 'client') {
@@ -791,9 +798,87 @@ function App() {
   const createUserCard = (item: User) => (
     <div className="mini-card" key={item.id}>
       <div className="name">{item.name}</div>
-      <div className="status">{item.email} • {item.role}</div>
+      <div className="directory-badges">
+        <span className="pill status-neutral">{item.role}</span>
+        {item.phone ? <span className="pill badge-upcoming">{item.phone}</span> : null}
+      </div>
+      <div className="status">{item.email}</div>
+      {item.address ? <div className="directory-detail">{item.address}</div> : null}
+      <div className="directory-actions">
+        {item.phone ? (
+          <button
+            type="button"
+            className="btn btn-secondary directory-action"
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(item.phone || '');
+                setStatusMessage(`Copied ${item.name}'s phone number.`);
+              } catch {
+                setStatusMessage('Unable to copy phone number.');
+              }
+            }}
+          >
+            Copy phone
+          </button>
+        ) : null}
+        {item.role === 'buddy' ? (
+          <button
+            type="button"
+            className="btn btn-secondary directory-action"
+            onClick={() => {
+              setSelectedAssignmentBuddyId(String(item.id));
+              setAdminTab('assignments');
+              setStatusMessage(`Showing assignments for ${item.name}.`);
+            }}
+          >
+            View assignments
+          </button>
+        ) : null}
+        {item.role === 'client' ? (
+          <button
+            type="button"
+            className="btn btn-secondary directory-action"
+            onClick={() => {
+              setSelectedVisitClientId(String(item.id));
+              setAdminTab('visits');
+              setStatusMessage(`Showing visits for ${item.name}.`);
+            }}
+          >
+            View visits
+          </button>
+        ) : null}
+      </div>
     </div>
   );
+
+  const matchesDirectorySearch = (item: User, query: string) => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) {
+      return true;
+    }
+
+    return [item.name, item.email, item.phone, item.role]
+      .filter(Boolean)
+      .some((value) => value?.toLowerCase().includes(needle));
+  };
+
+  const filteredBuddies = buddies.filter((item) => matchesDirectorySearch(item, directorySearch.buddy));
+  const filteredClients = clients.filter((item) => matchesDirectorySearch(item, directorySearch.client));
+
+  const sortDirectory = (items: User[], sortBy: 'name' | 'email') => [...items].sort((left, right) => {
+    const leftValue = (sortBy === 'email' ? left.email : left.name).toLowerCase();
+    const rightValue = (sortBy === 'email' ? right.email : right.name).toLowerCase();
+    return leftValue.localeCompare(rightValue);
+  });
+
+  const sortedBuddies = sortDirectory(filteredBuddies, directorySort.buddy);
+  const sortedClients = sortDirectory(filteredClients, directorySort.client);
+  const visibleAssignments = selectedAssignmentBuddyId
+    ? assignments.filter((assignment) => String(assignment.buddy_id) === selectedAssignmentBuddyId)
+    : assignments;
+  const visibleVisits = selectedVisitClientId
+    ? visits.filter((visit) => String(visit.elderly_id) === selectedVisitClientId)
+    : visits;
 
   const taskBadge = (status: string) => {
     if (status === 'completed' || status === 'done') return 'pill done';
@@ -865,6 +950,8 @@ function App() {
       {renderDashboardTabs(
         [
           { key: 'overview', label: 'Overview' },
+          { key: 'buddy-directory', label: 'Buddy Directory' },
+          { key: 'client-directory', label: 'Client Directory' },
           { key: 'assignments', label: 'Assignments' },
           { key: 'visits', label: 'Visits & Location' },
           { key: 'tasks', label: 'Tasks' },
@@ -939,18 +1026,96 @@ function App() {
           </form>
         </div>
       </div>}
+      {adminTab === 'buddy-directory' && <div className="panel">
+        <div className="directory-toolbar">
+          <div>
+            <h2>Buddy directory</h2>
+            <p className="directory-meta">{filteredBuddies.length} of {buddies.length} caretakers shown</p>
+          </div>
+          <div className="directory-controls">
+            <select
+              className="small-input directory-sort"
+              value={directorySort.buddy}
+              onChange={(event) => setDirectorySort({ ...directorySort, buddy: event.target.value as 'name' | 'email' })}
+            >
+              <option value="name">Sort by name</option>
+              <option value="email">Sort by email</option>
+            </select>
+            <input
+              className="small-input directory-search"
+              value={directorySearch.buddy}
+              onChange={(event) => setDirectorySearch({ ...directorySearch, buddy: event.target.value })}
+              placeholder="Search caretakers by name, email, phone, or role"
+            />
+          </div>
+        </div>
+        <div className="card-grid">{sortedBuddies.map(createUserCard)}</div>
+      </div>}
+      {adminTab === 'client-directory' && <div className="panel">
+        <div className="directory-toolbar">
+          <div>
+            <h2>Client directory</h2>
+            <p className="directory-meta">{filteredClients.length} of {clients.length} clients shown</p>
+          </div>
+          <div className="directory-controls">
+            <select
+              className="small-input directory-sort"
+              value={directorySort.client}
+              onChange={(event) => setDirectorySort({ ...directorySort, client: event.target.value as 'name' | 'email' })}
+            >
+              <option value="name">Sort by name</option>
+              <option value="email">Sort by email</option>
+            </select>
+            <input
+              className="small-input directory-search"
+              value={directorySearch.client}
+              onChange={(event) => setDirectorySearch({ ...directorySearch, client: event.target.value })}
+              placeholder="Search clients by name, email, phone, or role"
+            />
+          </div>
+        </div>
+        <div className="card-grid">{sortedClients.map(createUserCard)}</div>
+      </div>}
       {adminTab === 'overview' && <div className="section">
         <div className="panel">
-          <h2>Caretaker directory</h2>
-          <div className="card-grid">{buddies.map(createUserCard)}</div>
-        </div>
-        <div className="panel">
-          <h2>Client directory</h2>
-          <div className="card-grid">{clients.map(createUserCard)}</div>
+          <h2>Directory summary</h2>
+          <div className="card-grid">
+            <button type="button" className="mini-card" onClick={() => setAdminTab('buddy-directory')}>
+              <h3>Buddy Directory</h3>
+              <p className="mini-copy">View all caretakers and their profiles.</p>
+              <div className="metric">{buddies.length}</div>
+            </button>
+            <button type="button" className="mini-card" onClick={() => setAdminTab('client-directory')}>
+              <h3>Client Directory</h3>
+              <p className="mini-copy">View all client cases and profile details.</p>
+              <div className="metric">{clients.length}</div>
+            </button>
+          </div>
         </div>
       </div>}
       {adminTab === 'assignments' && <div className="panel">
-        <h2>Current assignments</h2>
+        <div className="assignment-toolbar">
+          <div>
+            <h2>Current assignments</h2>
+            <p className="directory-meta">
+              {selectedAssignmentBuddyId
+                ? `${visibleAssignments.length} assignments for the selected buddy`
+                : `${visibleAssignments.length} total assignments`}
+            </p>
+          </div>
+          {selectedAssignmentBuddyId ? (
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => {
+                setSelectedAssignmentBuddyId('');
+                setAdminTab('buddy-directory');
+              }}
+            >
+              Back to Buddy Directory
+            </button>
+          ) : null}
+        </div>
         <table className="panel-table">
           <thead>
             <tr>
@@ -963,7 +1128,7 @@ function App() {
             </tr>
           </thead>
           <tbody>
-            {assignments.map((assignment) => (
+            {visibleAssignments.map((assignment) => (
               <tr key={assignment.id}>
                 <td>{assignment.buddy_name || 'Unknown'}</td>
                 <td>{assignment.elderly_name || 'Unknown'}</td>
@@ -1021,7 +1186,28 @@ function App() {
         </table>
       </div>}
       {adminTab === 'visits' && <div className="panel">
-        <h2>Active visits and location</h2>
+        <div className="assignment-toolbar">
+          <div>
+            <h2>Active visits and location</h2>
+            <p className="directory-meta">
+              {selectedVisitClientId
+                ? `${visibleVisits.length} visits for the selected client`
+                : `${visibleVisits.length} total visits`}
+            </p>
+          </div>
+          {selectedVisitClientId ? (
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => {
+                setSelectedVisitClientId('');
+                setAdminTab('client-directory');
+              }}
+            >
+              Back to Client Directory
+            </button>
+          ) : null}
+        </div>
         <table className="panel-table">
           <thead>
             <tr>
@@ -1039,7 +1225,7 @@ function App() {
             </tr>
           </thead>
           <tbody>
-            {visits.map((visit) => {
+            {visibleVisits.map((visit) => {
               const liveLocation = buddyLocations[visit.buddy_id];
               const displayLocation = liveLocation
                 ? `${liveLocation.lat}, ${liveLocation.lng} (live)`

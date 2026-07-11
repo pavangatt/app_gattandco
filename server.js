@@ -1021,6 +1021,7 @@ if (fs.existsSync(distPath)) {
       return res.status(404).end();
     }
 
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
     return res.sendFile(path.resolve(distPath, 'index.html'));
   });
 } else {
