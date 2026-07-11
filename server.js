@@ -77,7 +77,7 @@ async function fetchUsersMapById(ids) {
     return {};
   }
 
-  const { data, error } = await supabase.from('users').select('id, full_name, email, role, phone').in('id', deduped);
+  const { data, error } = await supabase.from('users').select('id, full_name, email, role, phone, address').in('id', deduped);
   throwIfError(error, 'Unable to fetch users');
 
   const map = {};
@@ -125,7 +125,7 @@ async function ensureElderlyMember(clientId, fullName) {
   throwIfError(error, 'Unable to create elderly member');
 }
 
-async function ensureUser({ email, full_name, role, password, phone = '' }) {
+async function ensureUser({ email, full_name, role, password, phone = '', address = '' }) {
   const { data: rows, error: rowsError } = await supabase.from('users').select('id').eq('email', email).limit(1);
   throwIfError(rowsError, 'Unable to check existing user');
 
@@ -137,7 +137,7 @@ async function ensureUser({ email, full_name, role, password, phone = '' }) {
 
   const { data: created, error: createError } = await supabase
     .from('users')
-    .insert({ full_name, email, phone, password_hash: hashedPassword, role, created_at: new Date().toISOString() })
+    .insert({ full_name, email, phone, address, password_hash: hashedPassword, role, created_at: new Date().toISOString() })
     .select('id')
     .single();
   throwIfError(createError, 'Unable to create user');
@@ -441,7 +441,7 @@ app.post('/api/logout', (req, res) => {
 app.get('/api/users', async (req, res) => {
   const role = req.query.role;
   try {
-    let query = supabase.from('users').select('id, full_name, email, phone, role').order('full_name', { ascending: true });
+    let query = supabase.from('users').select('id, full_name, email, phone, address, role').order('full_name', { ascending: true });
     if (role && typeof role === 'string') {
       query = query.eq('role', role);
     }
@@ -455,7 +455,7 @@ app.get('/api/users', async (req, res) => {
 });
 
 app.post('/api/users', async (req, res) => {
-  const { name, email, phone, role, password } = req.body;
+  const { name, email, phone, address, role, password } = req.body;
 
   if (!name || !role || !password) {
     return res.status(400).json({ message: 'Name, role and password are required.' });
@@ -467,7 +467,24 @@ app.post('/api/users', async (req, res) => {
 
   try {
     const normalizedEmail = email || `${name.toLowerCase().replace(/\s+/g, '')}@gattandco.local`;
-    await ensureUser({ email: normalizedEmail, full_name: name, phone: phone || '', role, password });
+    const trimmedAddress = typeof address === 'string' ? address.trim() : '';
+    const userId = await ensureUser({
+      email: normalizedEmail,
+      full_name: name,
+      phone: phone || '',
+      address: trimmedAddress,
+      role,
+      password,
+    });
+
+    if (role === 'client' && userId && trimmedAddress.length > 0) {
+      const { error: addressError } = await supabase
+        .from('elderly_members')
+        .update({ address: trimmedAddress })
+        .eq('client_id', Number(userId));
+      throwIfError(addressError, 'Unable to save client address');
+    }
+
     return res.json({ message: `${role === 'buddy' ? 'Caretaker' : 'Client'} account created.` });
   } catch (error) {
     console.error('Create user failed:', error);

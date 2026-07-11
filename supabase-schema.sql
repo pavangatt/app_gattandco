@@ -12,6 +12,7 @@ create table if not exists public.users (
   full_name text not null,
   email text unique not null,
   phone text default '',
+  address text default '',
   password_hash text not null,
   role text not null check (role in ('admin','buddy','client')),
   is_active boolean not null default true,

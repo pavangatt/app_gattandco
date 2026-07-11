@@ -89,6 +89,7 @@ const initialCreateForm = {
   name: '',
   email: '',
   phone: '',
+  address: '',
   password: '',
   role: 'buddy' as 'buddy' | 'client',
 };
@@ -890,6 +891,14 @@ function App() {
             <label>
               Email (optional)
               <input className="small-input" value={createForm.email} onChange={handleCreateChange('email')} placeholder="optional email" />
+            </label>
+            <label>
+              Phone number
+              <input className="small-input" value={createForm.phone} onChange={handleCreateChange('phone')} placeholder="caretaker/client phone" />
+            </label>
+            <label>
+              Address
+              <input className="small-input" value={createForm.address} onChange={handleCreateChange('address')} placeholder="home address" />
             </label>
             <label>
               Password
