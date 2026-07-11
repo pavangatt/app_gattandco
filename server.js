@@ -50,6 +50,8 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
 });
 
 const currentLocations = {};
+let dbReady = false;
+let startupWarning = null;
 
 async function initDb() {
   const { error } = await supabase.from('users').select('id', { head: true, count: 'exact' });
@@ -305,15 +307,24 @@ async function seedDefaultUsers() {
   }
 }
 
-initDb()
-  .then(async () => {
-    await seedDefaultUsers();
-    await seedDefaultRequests();
-  })
-  .catch((error) => {
-    console.error('Database initialization failed:', error);
-    process.exit(1);
-  });
+async function initializeApp() {
+  try {
+    await initDb();
+    dbReady = true;
+
+    const shouldSeed = process.env.SEED_ON_START === 'true' || process.env.NODE_ENV !== 'production';
+    if (shouldSeed) {
+      await seedDefaultUsers();
+      await seedDefaultRequests();
+    }
+  } catch (error) {
+    dbReady = false;
+    startupWarning = error?.message || String(error);
+    console.error('Startup warning (server still running):', error);
+  }
+}
+
+initializeApp();
 
 app.post('/api/register', async (req, res, next) => {
   const { name, email, phone, password } = req.body;
@@ -954,7 +965,8 @@ async function seedDefaultRequests() {
 }
 
 app.get('/api/health', async (req, res) => {
-  res.json({ status: 'ok' });
+  const status = dbReady ? 'ok' : 'degraded';
+  res.json({ status, dbReady, startupWarning });
 });
 
 app.use((err, req, res, next) => {
