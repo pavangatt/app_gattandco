@@ -11,6 +11,16 @@ import fs from 'fs';
 dotenv.config();
 
 const app = express();
+
+// In production the app runs behind a TLS-terminating reverse proxy
+// (HTTPS is handled by the proxy, which forwards plain HTTP to Node).
+// Without trusting the proxy, Express treats the connection as insecure and
+// express-session refuses to set the `secure` session cookie, so login appears
+// to succeed but no session cookie is ever stored in the browser.
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
+
 app.use(cors());
 app.use(express.json());
 
