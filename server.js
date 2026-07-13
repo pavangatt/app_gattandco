@@ -11,12 +11,25 @@ import fs from 'fs';
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.set('trust proxy', 1);
+
+const corsOrigin = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map((value) => value.trim()).filter(Boolean)
+  : true;
+
+app.use(
+  cors({
+    origin: corsOrigin,
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 const MemoryStore = createMemoryStore(session);
 
 const sessionSecret = process.env.SESSION_SECRET || 'change-me-in-production';
+const sessionSameSiteRaw = String(process.env.SESSION_SAME_SITE || 'lax').trim().toLowerCase();
+const sessionSameSite = sessionSameSiteRaw === 'none' || sessionSameSiteRaw === 'strict' ? sessionSameSiteRaw : 'lax';
 app.use(
   session({
     store: new MemoryStore({
@@ -28,8 +41,8 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      secure: process.env.NODE_ENV === 'production' ? 'auto' : false,
+      sameSite: sessionSameSite,
       maxAge: 1000 * 60 * 60 * 8,
     },
   }),
@@ -1018,9 +1031,16 @@ app.post('/api/login', async (req, res) => {
 
     req.session.user = { id: user.id, user_id: user.user_id, name: user.full_name, email: user.email, role: user.role };
 
-    return res.json({
-      message: 'Login successful.',
-      user: { id: user.id, user_id: user.user_id, name: user.full_name, email: user.email, role: user.role },
+    return req.session.save((saveError) => {
+      if (saveError) {
+        console.error('Session save error:', saveError.message, saveError.stack);
+        return res.status(500).json({ message: 'Login failed while saving session.' });
+      }
+
+      return res.json({
+        message: 'Login successful.',
+        user: { id: user.id, user_id: user.user_id, name: user.full_name, email: user.email, role: user.role },
+      });
     });
   } catch (error) {
     console.error('Login error:', error.message, error.stack);
