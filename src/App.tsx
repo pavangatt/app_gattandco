@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { apiSend } from './api';
 
 type Role = 'admin' | 'buddy' | 'client';
 
@@ -986,11 +987,7 @@ function App() {
     }
 
     try {
-      const response = await fetch(`/api/requests/${requestId}/status`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: nextStatus }),
-      });
+      const response = await apiSend(`/api/requests/${requestId}/status`, 'PUT', { status: nextStatus });
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to update request status.');
@@ -1486,13 +1483,9 @@ function App() {
 
     setStatusMessage('');
     try {
-      const response = await fetch('/api/reminders/config', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          template_key: templateKey,
-          enabled,
-        }),
+      const response = await apiSend('/api/reminders/config', 'PUT', {
+        template_key: templateKey,
+        enabled,
       });
       const result = await response.json();
       if (!response.ok) {
@@ -1518,9 +1511,7 @@ function App() {
     setReminderRunnerLoading(true);
     setStatusMessage('');
     try {
-      const response = await fetch('/api/reminders/run', {
-        method: 'POST',
-      });
+      const response = await apiSend('/api/reminders/run', 'POST');
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to run reminder automation.');
@@ -1600,11 +1591,7 @@ function App() {
 
     setStatusMessage('');
     try {
-      const response = await fetch(`/api/assignments/${assignmentId}/extend`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ extended_until: extendedUntil }),
-      });
+      const response = await apiSend(`/api/assignments/${assignmentId}/extend`, 'POST', { extended_until: extendedUntil });
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to extend assignment.');
@@ -1648,16 +1635,12 @@ function App() {
         return parsed.toISOString();
       };
 
-      const response = await fetch(`/api/assignments/${assignmentId}/daily-records`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_date: new Date().toISOString().slice(0, 10),
-          intime: toIsoOrNull(draft.intime),
-          outtime: toIsoOrNull(draft.outtime),
-          entry_notes: draft.entry_notes,
-          exit_notes: draft.exit_notes,
-        }),
+      const response = await apiSend(`/api/assignments/${assignmentId}/daily-records`, 'POST', {
+        session_date: new Date().toISOString().slice(0, 10),
+        intime: toIsoOrNull(draft.intime),
+        outtime: toIsoOrNull(draft.outtime),
+        entry_notes: draft.entry_notes,
+        exit_notes: draft.exit_notes,
       });
       const result = await response.json();
       if (!response.ok) {
@@ -1686,14 +1669,10 @@ function App() {
 
     setStatusMessage('');
     try {
-      const response = await fetch('/api/visit-sessions/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          assignment_id: visit.assignment_id,
-          visit_id: visit.id,
-          entry_notes: '',
-        }),
+      const response = await apiSend('/api/visit-sessions/start', 'POST', {
+        assignment_id: visit.assignment_id,
+        visit_id: visit.id,
+        entry_notes: '',
       });
       const result = await response.json();
       if (!response.ok) {
@@ -1722,11 +1701,7 @@ function App() {
 
     setStatusMessage('');
     try {
-      const response = await fetch(`/api/visit-sessions/${sessionRow.id}/complete`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ exit_notes: '' }),
-      });
+      const response = await apiSend(`/api/visit-sessions/${sessionRow.id}/complete`, 'POST', { exit_notes: '' });
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to complete visit session.');
@@ -1760,17 +1735,13 @@ function App() {
 
     setStatusMessage('');
     try {
-      const response = await fetch(`/api/visit-sessions/${sessionRow.id}/backfill`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_date: sessionRow.session_date,
-          intime: sessionRow.intime,
-          outtime: sessionRow.outtime,
-          entry_notes: sessionRow.entry_notes,
-          exit_notes: sessionRow.exit_notes,
-          backfill_reason: reason.trim(),
-        }),
+      const response = await apiSend(`/api/visit-sessions/${sessionRow.id}/backfill`, 'POST', {
+        session_date: sessionRow.session_date,
+        intime: sessionRow.intime,
+        outtime: sessionRow.outtime,
+        entry_notes: sessionRow.entry_notes,
+        exit_notes: sessionRow.exit_notes,
+        backfill_reason: reason.trim(),
       });
       const result = await response.json();
       if (!response.ok) {
@@ -1813,9 +1784,7 @@ function App() {
     }
 
     try {
-      const response = await fetch('/api/requests/auto-view', {
-        method: 'POST',
-      });
+      const response = await apiSend('/api/requests/auto-view', 'POST');
       if (!response.ok) {
         return;
       }
@@ -1857,11 +1826,7 @@ function App() {
         const lat = position.coords.latitude.toFixed(5);
         const lng = position.coords.longitude.toFixed(5);
         try {
-          const response = await fetch('/api/location', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ buddy_id: user.id, lat, lng }),
-          });
+          const response = await apiSend('/api/location', 'POST', { buddy_id: user.id, lat, lng });
           const result = await response.json();
           setLocation(result.currentLocation || null);
           setStatusMessage('Location updated.');
@@ -1886,11 +1851,7 @@ function App() {
     }
 
     try {
-      const response = await fetch('/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identifier: authForm.identifier, password: authForm.password }),
-      });
+      const response = await apiSend('/api/login', 'POST', { identifier: authForm.identifier, password: authForm.password });
       const result = await response.json();
       if (!response.ok) {
         setMessage(result.message || 'Login failed.');
@@ -1909,7 +1870,7 @@ function App() {
 
   const handleLogout = async () => {
     try {
-      await fetch('/api/logout', { method: 'POST' });
+      await apiSend('/api/logout', 'POST');
     } catch {
       // Ignore network errors while clearing local session state.
     }
@@ -1952,11 +1913,7 @@ function App() {
     }
 
     try {
-      const response = await fetch('/api/users', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(createForm),
-      });
+      const response = await apiSend('/api/users', 'POST', createForm);
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to create user.');
@@ -2009,11 +1966,7 @@ function App() {
     }
 
     try {
-      const response = await fetch('/api/assignments', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(assignmentForm),
-      });
+      const response = await apiSend('/api/assignments', 'POST', assignmentForm);
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to create assignment.');
@@ -2030,11 +1983,7 @@ function App() {
   const handleTaskUpdate = async (taskId: number, newStatus: string) => {
     setStatusMessage('');
     try {
-      const response = await fetch(`/api/tasks/${taskId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: newStatus }),
-      });
+      const response = await apiSend(`/api/tasks/${taskId}`, 'PUT', { status: newStatus });
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to update task.');
@@ -2050,11 +1999,7 @@ function App() {
   const handleVisitUpdate = async (visitId: number, status_check: string, note: string) => {
     setStatusMessage('');
     try {
-      const response = await fetch(`/api/visits/${visitId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status_check, buddy_notes: note }),
-      });
+      const response = await apiSend(`/api/visits/${visitId}`, 'PUT', { status_check, buddy_notes: note });
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to update visit.');
@@ -2075,11 +2020,7 @@ function App() {
 
     setStatusMessage('');
     try {
-      const response = await fetch(`/api/assignments/${assignmentId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(draft),
-      });
+      const response = await apiSend(`/api/assignments/${assignmentId}`, 'PUT', draft);
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to update assignment.');
@@ -2095,9 +2036,7 @@ function App() {
   const handleClientAssignmentApprove = async (assignmentId: number) => {
     setStatusMessage('');
     try {
-      const response = await fetch(`/api/assignments/${assignmentId}/client-approve`, {
-        method: 'POST',
-      });
+      const response = await apiSend(`/api/assignments/${assignmentId}/client-approve`, 'POST');
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to approve assignment.');
@@ -2115,11 +2054,7 @@ function App() {
     const notes = assignmentEdits[assignmentId]?.admin_notes || '';
     setStatusMessage('');
     try {
-      const response = await fetch(`/api/assignments/${assignmentId}/approval-action`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, notes }),
-      });
+      const response = await apiSend(`/api/assignments/${assignmentId}/approval-action`, 'POST', { action, notes });
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to update assignment approval status.');
@@ -2141,11 +2076,7 @@ function App() {
 
     setStatusMessage('');
     try {
-      const response = await fetch(`/api/visits/${visitId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(draft),
-      });
+      const response = await apiSend(`/api/visits/${visitId}`, 'PUT', draft);
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to update visit.');
@@ -2168,11 +2099,7 @@ function App() {
     }
 
     try {
-      const response = await fetch('/api/requests', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: user.id, message: requestForm.message, request_type: requestForm.request_type }),
-      });
+      const response = await apiSend('/api/requests', 'POST', { user_id: user.id, message: requestForm.message, request_type: requestForm.request_type });
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to submit request.');
@@ -2261,18 +2188,14 @@ function App() {
     }
 
     try {
-      const response = await fetch('/api/client-contacts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_id: clientId,
-          elderly_id: elderly.id,
-          contact_name: draft.contact_name,
-          relation_label: draft.relation_label,
-          phone: draft.phone,
-          whatsapp_opt_in: draft.whatsapp_opt_in,
-          is_primary: draft.is_primary,
-        }),
+      const response = await apiSend('/api/client-contacts', 'POST', {
+        client_id: clientId,
+        elderly_id: elderly.id,
+        contact_name: draft.contact_name,
+        relation_label: draft.relation_label,
+        phone: draft.phone,
+        whatsapp_opt_in: draft.whatsapp_opt_in,
+        is_primary: draft.is_primary,
       });
 
       const result = await response.json();
@@ -2301,11 +2224,7 @@ function App() {
     }
 
     try {
-      const response = await fetch(`/api/client-contacts/${contact.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(draft),
-      });
+      const response = await apiSend(`/api/client-contacts/${contact.id}`, 'PATCH', draft);
 
       const result = await response.json();
       if (!response.ok) {
@@ -2323,9 +2242,7 @@ function App() {
 
   const handleDeleteFamilyContact = async (clientId: number, contactId: number) => {
     try {
-      const response = await fetch(`/api/client-contacts/${contactId}`, {
-        method: 'DELETE',
-      });
+      const response = await apiSend(`/api/client-contacts/${contactId}`, 'DELETE');
 
       const result = await response.json();
       if (!response.ok) {
@@ -2356,19 +2273,15 @@ function App() {
     messagePreview: string;
   }) => {
     try {
-      await fetch('/api/notification-logs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_id: payload.clientId,
-          family_contact_id: payload.familyContactId || null,
-          recipient_role: payload.recipientRole,
-          recipient_name: payload.recipientName,
-          recipient_phone: payload.recipientPhone,
-          channel: payload.channel,
-          template_key: payload.templateKey,
-          message_preview: payload.messagePreview,
-        }),
+      await apiSend('/api/notification-logs', 'POST', {
+        client_id: payload.clientId,
+        family_contact_id: payload.familyContactId || null,
+        recipient_role: payload.recipientRole,
+        recipient_name: payload.recipientName,
+        recipient_phone: payload.recipientPhone,
+        channel: payload.channel,
+        template_key: payload.templateKey,
+        message_preview: payload.messagePreview,
       });
     } catch {
       // Logging failure should not block the external notification action.
@@ -2612,14 +2525,10 @@ function App() {
 
     setPurgeArchivedLoading(true);
     try {
-      const response = await fetch('/api/purge-archived-case-history', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_id: Number(archivedHistoryClientId),
-          archive_month: archivedHistoryMonth,
-          confirm_text: purgeConfirmText,
-        }),
+      const response = await apiSend('/api/purge-archived-case-history', 'POST', {
+        client_id: Number(archivedHistoryClientId),
+        archive_month: archivedHistoryMonth,
+        confirm_text: purgeConfirmText,
       });
       const result = await response.json();
       if (!response.ok) {
@@ -3035,11 +2944,7 @@ function App() {
     await downloadClientCaseHistory(client, archiveMonth);
 
     try {
-      const response = await fetch('/api/archive-case-history', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ client_id: client.id, archive_month: archiveMonth }),
-      });
+      const response = await apiSend('/api/archive-case-history', 'POST', { client_id: client.id, archive_month: archiveMonth });
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to archive the selected month.');
