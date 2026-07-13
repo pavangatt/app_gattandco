@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import bcrypt from 'bcryptjs';
 import session from 'express-session';
+import createMemoryStore from 'memorystore';
 import path from 'path';
 import fs from 'fs';
 
@@ -13,9 +14,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const MemoryStore = createMemoryStore(session);
+
 const sessionSecret = process.env.SESSION_SECRET || 'change-me-in-production';
 app.use(
   session({
+    store: new MemoryStore({
+      checkPeriod: 1000 * 60 * 60 * 24,
+    }),
     name: 'gatt_sid',
     secret: sessionSecret,
     resave: false,

@@ -76,6 +76,11 @@ For existing deployments that already ran the base schema, also run these additi
 - [supabase-long-term-daily-records-migration.sql](supabase-long-term-daily-records-migration.sql)
 - [supabase-reminder-automation-migration.sql](supabase-reminder-automation-migration.sql)
 
+For a clean demo reset with minimal data, run:
+- [supabase-reset-minimal-seed.sql](supabase-reset-minimal-seed.sql)
+
+This script truncates operational tables and recreates a compact valid dataset for flow testing.
+
 This schema includes:
 - Role-based users (`admin`, `buddy`, `client`)
 - Elderly profiles and client visibility mapping
