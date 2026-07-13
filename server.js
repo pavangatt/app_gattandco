@@ -73,9 +73,17 @@ function throwIfError(error, context) {
   }
 }
 
-function ensureAdminSession(req, res) {
+function ensureAuthenticated(req, res) {
   if (!req.session.user) {
     res.status(401).json({ message: 'Login required.' });
+    return false;
+  }
+
+  return true;
+}
+
+function ensureAdminSession(req, res) {
+  if (!ensureAuthenticated(req, res)) {
     return false;
   }
 
@@ -185,8 +193,7 @@ function normalizeDateOnly(value, fallback = null) {
 }
 
 function ensureAdminOrBuddySession(req, res) {
-  if (!req.session.user) {
-    res.status(401).json({ message: 'Login required.' });
+  if (!ensureAuthenticated(req, res)) {
     return false;
   }
 
@@ -2684,8 +2691,8 @@ app.post('/api/assignments/:id/approval-action', async (req, res) => {
 });
 
 app.post('/api/assignments/:id/client-approve', async (req, res) => {
-  if (!req.session.user) {
-    return res.status(401).json({ message: 'Login required.' });
+  if (!ensureAuthenticated(req, res)) {
+    return;
   }
 
   if (req.session.user.role !== 'client') {
@@ -2803,8 +2810,8 @@ app.post('/api/assignments/:id/extend', async (req, res) => {
 });
 
 app.get('/api/assignments/:id/daily-records', async (req, res) => {
-  if (!req.session.user) {
-    return res.status(401).json({ message: 'Login required.' });
+  if (!ensureAuthenticated(req, res)) {
+    return;
   }
 
   const assignmentId = Number(req.params.id);
@@ -2857,8 +2864,8 @@ app.get('/api/assignments/:id/daily-records', async (req, res) => {
 });
 
 app.post('/api/assignments/:id/daily-records', async (req, res) => {
-  if (!req.session.user) {
-    return res.status(401).json({ message: 'Login required.' });
+  if (!ensureAuthenticated(req, res)) {
+    return;
   }
 
   if (!['admin', 'buddy'].includes(req.session.user.role)) {
@@ -2956,8 +2963,8 @@ app.post('/api/assignments/:id/daily-records', async (req, res) => {
 });
 
 app.get('/api/assignment-lifecycle-audits', async (req, res) => {
-  if (!req.session.user) {
-    return res.status(401).json({ message: 'Login required.' });
+  if (!ensureAuthenticated(req, res)) {
+    return;
   }
 
   if (!['admin', 'client'].includes(req.session.user.role)) {
@@ -3249,8 +3256,8 @@ app.post('/api/location', async (req, res) => {
 });
 
 app.get('/api/location/current', async (req, res) => {
-  if (!req.session.user) {
-    return res.status(401).json({ message: 'Login required.' });
+  if (!ensureAuthenticated(req, res)) {
+    return;
   }
 
   const assignmentId = Number(req.query.assignment_id);
