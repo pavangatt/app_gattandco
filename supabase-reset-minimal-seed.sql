@@ -50,33 +50,54 @@ restart identity cascade;
 -- 1) Users (10 rows)
 insert into public.users (user_id, full_name, email, phone, address, client_onboarding_type, password_hash, role, is_active)
 values
-  ('admin01', 'Admin User', 'admin01@demo.gattandco.local', '9000000000', 'HQ Office', null, '$2a$10$FnJZ7jO5Ui7WSQ0.Tn02g.e3GlJNXw.Ld/j6OhidoqCoi8r7/sL22', 'admin', true);
+  ('admin01', 'Nisha Rao', 'admin01@demo.gattandco.local', '9000000000', 'Central Admin Office, Bengaluru', null, '$2a$10$FnJZ7jO5Ui7WSQ0.Tn02g.e3GlJNXw.Ld/j6OhidoqCoi8r7/sL22', 'admin', true);
 
+with buddy_seed as (
+  select *
+  from (
+    values
+      (1, 'Arjun Mehta', 'Indiranagar, Bengaluru'),
+      (2, 'Priya Nair', 'JP Nagar, Bengaluru'),
+      (3, 'Rahul Verma', 'Whitefield, Bengaluru'),
+      (4, 'Sneha Iyer', 'HSR Layout, Bengaluru')
+  ) as t(i, full_name, address)
+)
 insert into public.users (user_id, full_name, email, phone, address, client_onboarding_type, password_hash, role, is_active)
 select
-  format('buddy%02s', i),
-  format('Buddy %s', i),
-  format('buddy%02s@demo.gattandco.local', i),
-  format('91000000%02s', i),
-  format('Buddy Block %s, Bengaluru', i),
+  ('buddy' || lpad(bs.i::text, 2, '0')),
+  bs.full_name,
+  ('buddy' || lpad(bs.i::text, 2, '0') || '@demo.gattandco.local'),
+  ('91000000' || lpad(bs.i::text, 2, '0')),
+  bs.address,
   null,
   '$2a$10$FnJZ7jO5Ui7WSQ0.Tn02g.e3GlJNXw.Ld/j6OhidoqCoi8r7/sL22',
   'buddy',
   true
-from generate_series(1, 4) as gs(i);
+from buddy_seed bs;
 
+with client_seed as (
+  select *
+  from (
+    values
+      (1, 'Anita Sharma', 'Koramangala, Bengaluru', 'kin_requested'),
+      (2, 'Vikram Joshi', 'Malleshwaram, Bengaluru', 'self_service'),
+      (3, 'Meera Menon', 'Banashankari, Bengaluru', 'kin_requested'),
+      (4, 'Karan Patel', 'Hebbal, Bengaluru', 'self_service'),
+      (5, 'Pooja Kulkarni', 'Sarjapur Road, Bengaluru', 'kin_requested')
+  ) as t(i, full_name, address, onboarding)
+)
 insert into public.users (user_id, full_name, email, phone, address, client_onboarding_type, password_hash, role, is_active)
 select
-  format('client%02s', i),
-  format('Client %s', i),
-  format('client%02s@demo.gattandco.local', i),
-  format('92000000%02s', i),
-  format('Client Street %s, Bengaluru', i),
-  case when i % 2 = 0 then 'self_service' else 'kin_requested' end,
+  ('client' || lpad(cs.i::text, 2, '0')),
+  cs.full_name,
+  ('client' || lpad(cs.i::text, 2, '0') || '@demo.gattandco.local'),
+  ('92000000' || lpad(cs.i::text, 2, '0')),
+  cs.address,
+  cs.onboarding,
   '$2a$10$FnJZ7jO5Ui7WSQ0.Tn02g.e3GlJNXw.Ld/j6OhidoqCoi8r7/sL22',
   'client',
   true
-from generate_series(1, 5) as gs(i);
+from client_seed cs;
 
 -- 2) Elderly members (10 rows, 2 per client)
 with clients as (
@@ -88,6 +109,14 @@ slots as (
   select c.id as client_id, c.client_rn, s.slot
   from clients c
   cross join generate_series(1, 2) as s(slot)
+),
+slot_rows as (
+  select
+    s.client_id,
+    s.client_rn,
+    s.slot,
+    row_number() over (order by s.client_rn, s.slot) as rn
+  from slots s
 )
 insert into public.elderly_members (
   client_id,
@@ -104,19 +133,51 @@ insert into public.elderly_members (
   is_active
 )
 select
-  client_id,
-  format('Elderly %s-%s', client_rn, slot),
-  case when (client_rn + slot) % 2 = 0 then 'Female' else 'Male' end,
-  68 + ((client_rn + slot) % 12),
-  case when (client_rn + slot) % 4 = 0 then 'A+' when (client_rn + slot) % 4 = 1 then 'B+' when (client_rn + slot) % 4 = 2 then 'O+' else 'AB+' end,
-  case when slot = 1 then 'BP monitoring' else 'Diabetes monitoring' end,
-  case when slot = 2 then 'Dust allergy' else 'None' end,
-  format('Care Address %s-%s, Bengaluru', client_rn, slot),
-  format('Family Contact %s', client_rn),
-  format('9300000%03s', ((client_rn - 1) * 2 + slot)),
-  current_date - (((client_rn - 1) * 2 + slot) * interval '3 day'),
+  sr.client_id,
+  case sr.rn
+    when 1 then 'Savitri Sharma'
+    when 2 then 'Raghav Sharma'
+    when 3 then 'Leela Joshi'
+    when 4 then 'Mahesh Joshi'
+    when 5 then 'Devika Menon'
+    when 6 then 'Gopal Menon'
+    when 7 then 'Kamala Patel'
+    when 8 then 'Harish Patel'
+    when 9 then 'Usha Kulkarni'
+    else 'Mohan Kulkarni'
+  end,
+  case when (sr.client_rn + sr.slot) % 2 = 0 then 'Female' else 'Male' end,
+  66 + ((sr.rn * 2) % 16),
+  case when sr.rn % 4 = 0 then 'A+' when sr.rn % 4 = 1 then 'B+' when sr.rn % 4 = 2 then 'O+' else 'AB+' end,
+  case
+    when sr.rn in (1, 4, 8) then 'BP monitoring and evening walk support'
+    when sr.rn in (2, 5, 9) then 'Diabetes and diet tracking'
+    else 'Post-surgery mobility support'
+  end,
+  case when sr.rn in (3, 7) then 'Dust allergy' else 'None' end,
+  case sr.rn
+    when 1 then '4th Block, Koramangala, Bengaluru'
+    when 2 then '4th Block, Koramangala, Bengaluru'
+    when 3 then '8th Cross, Malleshwaram, Bengaluru'
+    when 4 then '8th Cross, Malleshwaram, Bengaluru'
+    when 5 then '3rd Stage, Banashankari, Bengaluru'
+    when 6 then '3rd Stage, Banashankari, Bengaluru'
+    when 7 then 'Outer Ring Road, Hebbal, Bengaluru'
+    when 8 then 'Outer Ring Road, Hebbal, Bengaluru'
+    when 9 then 'Kaikondrahalli, Sarjapur Road, Bengaluru'
+    else 'Kaikondrahalli, Sarjapur Road, Bengaluru'
+  end,
+  case
+    when sr.client_rn = 1 then 'Anita Sharma'
+    when sr.client_rn = 2 then 'Vikram Joshi'
+    when sr.client_rn = 3 then 'Meera Menon'
+    when sr.client_rn = 4 then 'Karan Patel'
+    else 'Pooja Kulkarni'
+  end,
+  ('9300000' || lpad(sr.rn::text, 3, '0')),
+  current_date - (sr.rn * interval '3 day'),
   true
-from slots;
+from slot_rows sr;
 
 -- 3) Assignments (10 rows)
 with buddies as (
@@ -243,8 +304,22 @@ select
   (current_date - ((row_number() over (order by a.id) - 1) * interval '1 day'))::timestamptz + interval '10:05',
   format('%s,%s', 12.950000 + (a.id * 0.001), 77.560000 + (a.id * 0.001)),
   case when row_number() over (order by a.id) in (3, 8) then 'Attention needed' else 'Good' end,
-  format('Visit note for assignment %s', a.id),
-  'Visit update available for client.'
+  case (row_number() over (order by a.id))
+    when 1 then 'Morning mobility support and medication reminder completed.'
+    when 2 then 'Assisted with breakfast and hydration checks.'
+    when 3 then 'Follow-up needed, client not available at scheduled time.'
+    when 4 then 'Vitals captured and caregiver coordination done.'
+    when 5 then 'In-progress home support, pending checkout update.'
+    when 6 then 'Light physiotherapy session completed.'
+    when 7 then 'Hospital follow-up preparation support completed.'
+    when 8 then 'Missed due to family emergency, reschedule requested.'
+    when 9 then 'Evening care routine completed smoothly.'
+    else 'General wellness check completed.'
+  end,
+  case
+    when row_number() over (order by a.id) in (3, 8) then 'Visit could not be completed; follow-up is planned.'
+    else 'Visit update shared with family and client.'
+  end
 from public.assignments a
 order by a.id;
 
@@ -360,7 +435,13 @@ select
     when 1 then 'feedback'
     else 'special_care'
   end,
-  format('Request %s for elderly record %s', e.rn, e.id),
+  case (e.rn % 5)
+    when 0 then 'Need evening caregiver support for next two days.'
+    when 1 then 'Please arrange medicine pickup before tomorrow morning.'
+    when 2 then 'Requesting feedback call regarding weekly progress.'
+    when 3 then 'Need help with hospital follow-up visit scheduling.'
+    else 'Please update care notes for family review.'
+  end,
   case
     when e.rn in (1, 2) then 'new'
     when e.rn in (3, 4) then 'viewed'
@@ -392,6 +473,12 @@ contact_rows as (
   from clients c
   join generate_series(1, 2) as gs(slot) on true
   join elders e on e.client_id = c.id and e.elder_slot = gs.slot
+),
+contact_ranked as (
+  select
+    cr.*,
+    row_number() over (order by cr.client_rn, cr.slot) as rn
+  from contact_rows cr
 )
 insert into public.client_family_contacts (
   client_id,
@@ -405,13 +492,39 @@ insert into public.client_family_contacts (
 select
   cr.client_id,
   cr.elderly_id,
-  format('Family %s-%s', cr.client_rn, cr.slot),
-  case when cr.slot = 1 then 'Daughter/Son' else 'Sibling' end,
-  format('940000%04s', ((cr.client_rn - 1) * 2 + cr.slot)),
+  case cr.rn
+    when 1 then 'Rohit Sharma'
+    when 2 then 'Kavya Sharma'
+    when 3 then 'Neha Joshi'
+    when 4 then 'Amit Joshi'
+    when 5 then 'Sanjay Menon'
+    when 6 then 'Asha Menon'
+    when 7 then 'Ritu Patel'
+    when 8 then 'Nitin Patel'
+    when 9 then 'Ajay Kulkarni'
+    else 'Rekha Kulkarni'
+  end,
+  case
+    when cr.slot = 1 then 'Daughter/Son'
+    when cr.client_rn in (2, 4) then 'Spouse'
+    else 'Sibling'
+  end,
+  ('940000' || lpad(cr.rn::text, 4, '0')),
   true,
   case when cr.slot = 1 then true else false end
-from contact_rows cr
+from contact_ranked cr
 order by cr.client_rn, cr.slot;
+
+-- Defensive cleanup to guarantee no accidental whitespace in key identity fields.
+update public.users
+set
+  user_id = regexp_replace(coalesce(user_id, ''), '\\s+', '', 'g'),
+  email = regexp_replace(coalesce(email, ''), '\\s+', '', 'g'),
+  phone = regexp_replace(coalesce(phone, ''), '\\s+', '', 'g');
+
+update public.client_family_contacts
+set
+  phone = regexp_replace(coalesce(phone, ''), '\\s+', '', 'g');
 
 -- 13) Family contact audits (10 rows)
 insert into public.client_family_contact_audits (
@@ -484,5 +597,133 @@ set
   enabled = excluded.enabled,
   updated_by = excluded.updated_by,
   updated_at = now();
+
+-- 16) Optional edge-case mode for QA flow testing
+-- Set apply_edge_cases to false if you want the plain baseline dataset only.
+do $$
+declare
+  apply_edge_cases boolean := true;
+begin
+  if not apply_edge_cases then
+    return;
+  end if;
+
+  -- Assignment edge cases: paused, rejected, rescheduled.
+  with ranked_assignments as (
+    select id, row_number() over (order by id) as rn
+    from public.assignments
+  )
+  update public.assignments a
+  set
+    status = case
+      when ra.rn = 1 then 'paused'
+      when ra.rn = 2 then 'paused'
+      else a.status
+    end,
+    approval_state = case
+      when ra.rn = 2 then 'rejected'
+      when ra.rn = 3 then 'rescheduled'
+      else a.approval_state
+    end,
+    admin_notes = case
+      when ra.rn = 1 then 'Edge case: temporarily paused by admin for QA'
+      when ra.rn = 2 then 'Edge case: rejected for missing documents'
+      when ra.rn = 3 then 'Edge case: rescheduled by care coordinator'
+      else a.admin_notes
+    end
+  from ranked_assignments ra
+  where a.id = ra.id;
+
+  insert into public.assignment_lifecycle_audits (assignment_id, from_status, to_status, actor_user_id, notes)
+  select
+    a.id,
+    'approved',
+    case
+      when ra.rn = 1 then 'paused'
+      when ra.rn = 2 then 'rejected'
+      when ra.rn = 3 then 'rescheduled'
+      else 'approved'
+    end,
+    (select id from public.users where role = 'admin' limit 1),
+    'Edge case transition seeded for validation.'
+  from public.assignments a
+  join (
+    select id, row_number() over (order by id) as rn
+    from public.assignments
+  ) ra on ra.id = a.id
+  where ra.rn in (1, 2, 3);
+
+  -- Visit edge cases: cancelled and scheduled future row.
+  with ranked_visits as (
+    select id, row_number() over (order by id) as rn
+    from public.visits
+  )
+  update public.visits v
+  set
+    visit_status = case
+      when rv.rn = 1 then 'cancelled'
+      when rv.rn = 2 then 'scheduled'
+      else v.visit_status
+    end,
+    buddy_notes = case
+      when rv.rn = 1 then 'Edge case: cancelled due to caregiver unavailability.'
+      when rv.rn = 2 then 'Edge case: upcoming scheduled visit for tomorrow.'
+      else v.buddy_notes
+    end,
+    client_visible_notes = case
+      when rv.rn = 1 then 'Visit cancelled and family notified.'
+      when rv.rn = 2 then 'Visit is scheduled and pending start.'
+      else v.client_visible_notes
+    end,
+    scheduled_date = case
+      when rv.rn = 2 then current_date + interval '1 day'
+      else v.scheduled_date
+    end
+  from ranked_visits rv
+  where v.id = rv.id;
+
+  -- Task edge case aligned with cancelled visit.
+  with ranked_tasks as (
+    select id, row_number() over (order by id) as rn
+    from public.visit_tasks
+  )
+  update public.visit_tasks t
+  set
+    status = case when rt.rn = 1 then 'skipped' else t.status end,
+    buddy_remarks = case when rt.rn = 1 then 'Edge case: task skipped because visit was cancelled.' else t.buddy_remarks end,
+    client_visible_remarks = case when rt.rn = 1 then 'Task skipped due to cancelled visit.' else t.client_visible_remarks end,
+    carry_forward_reason = case when rt.rn = 1 then 'Visit cancellation' else t.carry_forward_reason end
+  from ranked_tasks rt
+  where t.id = rt.id;
+
+  -- Request edge cases: include read + awaiting_assignee explicitly.
+  with ranked_requests as (
+    select id, row_number() over (order by id) as rn
+    from public.client_requests
+  )
+  update public.client_requests r
+  set
+    status = case
+      when rr.rn = 1 then 'new'
+      when rr.rn = 2 then 'viewed'
+      when rr.rn = 3 then 'read'
+      when rr.rn = 4 then 'awaiting_assignee'
+      when rr.rn in (5, 6) then 'assigned'
+      when rr.rn in (7, 8) then 'resolved'
+      else 'closed'
+    end,
+    resolved_at = case
+      when rr.rn >= 7 then now() - (rr.rn * interval '1 hour')
+      else null
+    end,
+    message = case
+      when rr.rn = 3 then 'Edge case: request marked as read, waiting for assignment.'
+      when rr.rn = 4 then 'Edge case: awaiting assignee due to shift handover.'
+      else r.message
+    end
+  from ranked_requests rr
+  where r.id = rr.id;
+end
+$$;
 
 commit;
