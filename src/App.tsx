@@ -507,6 +507,25 @@ type AssignmentEditDraft = {
   admin_notes: string;
 };
 
+async function readJson<T>(response: Response, fallbackMessage: string): Promise<T> {
+  let payload: unknown = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const message =
+      payload && typeof payload === 'object' && 'message' in payload && (payload as { message?: unknown }).message
+        ? String((payload as { message?: unknown }).message)
+        : fallbackMessage;
+    throw new Error(message);
+  }
+
+  return payload as T;
+}
+
 function App() {
   type AdminTab = 'overview' | 'buddy-directory' | 'client-directory' | 'assignments' | 'visits' | 'tasks' | 'requests' | 'calendar-reporting' | 'reminders' | 'archived-history';
   type ClientTab = 'visits' | 'tasks' | 'requests';
@@ -640,7 +659,8 @@ function App() {
       if (storedTemplates) {
         setNotificationTemplateByClient(JSON.parse(storedTemplates) as Record<number, NotificationTemplateKey>);
       }
-    } catch {
+    } catch (error) {
+      console.warn('Discarding corrupt notification template cache:', error);
       localStorage.removeItem(NOTIFICATION_TEMPLATE_STORAGE_KEY);
     }
 
@@ -649,7 +669,8 @@ function App() {
       if (storedCustomMessages) {
         setCustomNotificationMessageByClient(JSON.parse(storedCustomMessages) as Record<number, string>);
       }
-    } catch {
+    } catch (error) {
+      console.warn('Discarding corrupt custom notification cache:', error);
       localStorage.removeItem(CUSTOM_NOTIFICATION_STORAGE_KEY);
     }
 
@@ -658,7 +679,8 @@ function App() {
       try {
         const cachedUser = JSON.parse(cachedUserRaw) as User;
         setUser(cachedUser);
-      } catch {
+      } catch (error) {
+        console.warn('Discarding corrupt cached user:', error);
         sessionStorage.removeItem('gatt_user');
       }
     }
@@ -674,7 +696,8 @@ function App() {
           setUser(result.user as User);
           sessionStorage.setItem('gatt_user', JSON.stringify(result.user));
         }
-      } catch {
+      } catch (error) {
+        console.error('Session restore failed:', error);
         setUser(null);
         sessionStorage.removeItem('gatt_user');
       }
@@ -1151,7 +1174,8 @@ function App() {
             guard_reason_code: result.guard_reason_code || null,
             message: result.message || null,
           };
-        } catch {
+        } catch (error) {
+          console.error(`Load location for assignment ${assignmentId} failed:`, error);
           locationMap[assignmentId] = {
             currentLocation: null,
             active: false,
@@ -1214,7 +1238,8 @@ function App() {
             setTasks(cached.tasks || []);
           }
         }
-      } catch {
+      } catch (error) {
+        console.warn('Discarding corrupt dashboard cache:', error);
         sessionStorage.removeItem(cacheKey);
       }
     }
@@ -1238,17 +1263,17 @@ function App() {
           fetch('/api/assignment-lifecycle-audits'),
         ]);
 
-        const buddyData = (await buddyRes.json()) as ApiUser[];
-        const clientData = (await clientRes.json()) as ApiUser[];
-        const elderlyData = (await elderlyRes.json()) as ElderlyMember[];
-        const assignmentData = (await assignmentRes.json()) as Assignment[];
-        const visitData = (await visitRes.json()) as Visit[];
-        const taskData = (await taskRes.json()) as Task[];
-        const requestData = (await requestRes.json()) as RequestEntry[];
-        const contactData = (await contactsRes.json()) as FamilyContact[];
-        const contactAuditData = (await contactAuditRes.json()) as FamilyContactAuditEntry[];
-        const notificationLogData = (await notificationLogsRes.json()) as NotificationActionLogEntry[];
-        const assignmentAuditData = (await assignmentAuditRes.json()) as AssignmentLifecycleAuditEntry[];
+        const buddyData = await readJson<ApiUser[]>(buddyRes, 'Unable to load caretakers.');
+        const clientData = await readJson<ApiUser[]>(clientRes, 'Unable to load clients.');
+        const elderlyData = await readJson<ElderlyMember[]>(elderlyRes, 'Unable to load elderly members.');
+        const assignmentData = await readJson<Assignment[]>(assignmentRes, 'Unable to load assignments.');
+        const visitData = await readJson<Visit[]>(visitRes, 'Unable to load visits.');
+        const taskData = await readJson<Task[]>(taskRes, 'Unable to load tasks.');
+        const requestData = await readJson<RequestEntry[]>(requestRes, 'Unable to load requests.');
+        const contactData = await readJson<FamilyContact[]>(contactsRes, 'Unable to load client contacts.');
+        const contactAuditData = await readJson<FamilyContactAuditEntry[]>(contactAuditRes, 'Unable to load client contact audit.');
+        const notificationLogData = await readJson<NotificationActionLogEntry[]>(notificationLogsRes, 'Unable to load notification logs.');
+        const assignmentAuditData = await readJson<AssignmentLifecycleAuditEntry[]>(assignmentAuditRes, 'Unable to load assignment audits.');
         const contactsByClient: Record<number, FamilyContact[]> = {};
         const contactAuditByClient: Record<number, FamilyContactAuditEntry[]> = {};
         const notificationLogsByClientMap: Record<number, NotificationActionLogEntry[]> = {};
@@ -1316,10 +1341,10 @@ function App() {
           fetch(`/api/tasks?client_id=${user.id}`),
           fetch(`/api/requests?user_id=${user.id}`),
         ]);
-        const assignmentData = (await assignmentRes.json()) as Assignment[];
-        const visitData = (await visitRes.json()) as Visit[];
-        const taskData = (await taskRes.json()) as Task[];
-        const requestData = (await requestRes.json()) as RequestEntry[];
+        const assignmentData = await readJson<Assignment[]>(assignmentRes, 'Unable to load assignments.');
+        const visitData = await readJson<Visit[]>(visitRes, 'Unable to load visits.');
+        const taskData = await readJson<Task[]>(taskRes, 'Unable to load tasks.');
+        const requestData = await readJson<RequestEntry[]>(requestRes, 'Unable to load requests.');
         setAssignments(assignmentData);
         setVisits(visitData);
         setTasks(taskData);
@@ -1344,11 +1369,11 @@ function App() {
           fetch(`/api/visits?buddy_id=${user.id}`),
           fetch(`/api/tasks?buddy_id=${user.id}`),
         ]);
-        const assignmentData = (await assignmentRes.json()) as Assignment[];
-        const visitData = await visitRes.json();
+        const assignmentData = await readJson<Assignment[]>(assignmentRes, 'Unable to load assignments.');
+        const visitData = await readJson<Visit[]>(visitRes, 'Unable to load visits.');
         setAssignments(assignmentData);
         setVisits(visitData);
-        const taskData = await taskRes.json();
+        const taskData = await readJson<Task[]>(taskRes, 'Unable to load tasks.');
         setTasks(taskData);
         await loadDailyRecordsForAssignments(assignmentData);
 
@@ -1364,6 +1389,7 @@ function App() {
         return visitData;
       }
     } catch (error) {
+      console.error('Load dashboard failed:', error);
       setStatusMessage('Unable to load dashboard data.');
     }
 
@@ -1381,7 +1407,8 @@ function App() {
       }
       const result = await response.json();
       setRequests(result);
-    } catch {
+    } catch (error) {
+      console.error('Load request history failed:', error);
       setStatusMessage('Unable to load request history.');
     }
   };
@@ -1409,7 +1436,8 @@ function App() {
 
           const result = (await response.json()) as DailyRecord[];
           map[assignment.id] = result;
-        } catch {
+        } catch (error) {
+          console.error(`Load daily records for assignment ${assignment.id} failed:`, error);
           map[assignment.id] = [];
         }
       }),
@@ -1433,7 +1461,8 @@ function App() {
       }
 
       setVisitSessionHistory((result as VisitSessionHistoryEntry[]) || []);
-    } catch {
+    } catch (error) {
+      console.error('Load visit session history failed:', error);
       setStatusMessage('Unable to connect to the server for visit session history.');
     } finally {
       setVisitSessionHistoryLoading(false);
@@ -1472,7 +1501,8 @@ function App() {
 
       setReminderConfigByKey(nextEnabled);
       setReminderTemplatePreviewByKey(nextPreview);
-    } catch {
+    } catch (error) {
+      console.error('Load reminder config failed:', error);
       setStatusMessage('Unable to connect to the server for reminder config.');
     } finally {
       setReminderConfigLoading(false);
@@ -1505,7 +1535,8 @@ function App() {
         [templateKey]: enabled,
       }));
       setStatusMessage(result.message || 'Reminder setting updated.');
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -1531,7 +1562,8 @@ function App() {
       const skipped = Number(result?.stats?.visit_reminder_d1_skipped_duplicates || 0);
       setStatusMessage(`${result.message || 'Reminder runner completed.'} Generated ${generated} reminder log(s), skipped ${skipped} duplicate(s).`);
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     } finally {
       setReminderRunnerLoading(false);
@@ -1584,7 +1616,8 @@ function App() {
 
       setMonthlySummary(summaryPayload as MonthlySummaryPayload);
       setMonthlyCalendar(calendarPayload as MonthlyCalendarPayload);
-    } catch {
+    } catch (error) {
+      console.error('Load monthly reports failed:', error);
       setStatusMessage('Unable to connect to the server for monthly reporting.');
     } finally {
       setMonthlyReportsLoading(false);
@@ -1613,7 +1646,8 @@ function App() {
 
       setStatusMessage(result.message || 'Assignment extended.');
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -1667,8 +1701,9 @@ function App() {
 
       setStatusMessage(result.message || 'Daily record saved.');
       await loadDashboard();
-    } catch {
-      setStatusMessage('Unable to connect to the server.');
+    } catch (error) {
+      console.error('Save daily record failed:', error);
+      setStatusMessage(error instanceof Error && error.message ? error.message : 'Unable to connect to the server.');
     }
   };
 
@@ -1703,7 +1738,8 @@ function App() {
 
       setStatusMessage(result.message || 'Visit session started.');
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -1735,7 +1771,8 @@ function App() {
 
       setStatusMessage(result.message || 'Visit session completed.');
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -1780,7 +1817,8 @@ function App() {
 
       setStatusMessage(result.message || 'Visit session backfilled.');
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -1800,7 +1838,8 @@ function App() {
       }
 
       setRequestOpsMetrics(result as RequestOpsMetrics);
-    } catch {
+    } catch (error) {
+      console.error('Load request ops metrics failed:', error);
       setStatusMessage('Unable to connect to the server for request ops metrics.');
     } finally {
       setRequestOpsLoading(false);
@@ -1822,8 +1861,9 @@ function App() {
 
       await loadRequests(user.id, true);
       await loadRequestOpsMetrics();
-    } catch {
+    } catch (error) {
       // Do not block tab rendering if auto-advance fails.
+      console.warn('Auto-advance requests failed:', error);
     }
   };
 
@@ -1863,10 +1903,15 @@ function App() {
             body: JSON.stringify({ buddy_id: user.id, lat, lng }),
           });
           const result = await response.json();
+          if (!response.ok) {
+            setStatusMessage(result.message || 'Unable to update location.');
+            return;
+          }
           setLocation(result.currentLocation || null);
           setStatusMessage('Location updated.');
           await loadDashboard();
         } catch (error) {
+          console.error('Location update failed:', error);
           setStatusMessage('Unable to update location.');
         }
       },
@@ -1910,8 +1955,9 @@ function App() {
   const handleLogout = async () => {
     try {
       await fetch('/api/logout', { method: 'POST' });
-    } catch {
+    } catch (error) {
       // Ignore network errors while clearing local session state.
+      console.warn('Logout request failed:', error);
     }
 
     setUser(null);
@@ -2106,7 +2152,8 @@ function App() {
 
       setStatusMessage(result.message || 'Assignment approved.');
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -2128,7 +2175,8 @@ function App() {
 
       setStatusMessage(result.message || 'Assignment approval status updated.');
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -2287,7 +2335,8 @@ function App() {
         [clientId]: createEmptyContactDraft(),
       }));
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -2316,7 +2365,8 @@ function App() {
       setStatusMessage(result.message || 'Family contact updated.');
       cancelEditingFamilyContact(contact.id);
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -2336,7 +2386,8 @@ function App() {
       setStatusMessage(result.message || 'Family contact removed.');
       cancelEditingFamilyContact(contactId);
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Request failed:', error);
       setStatusMessage('Unable to connect to the server.');
     }
   };
@@ -2370,8 +2421,9 @@ function App() {
           message_preview: payload.messagePreview,
         }),
       });
-    } catch {
+    } catch (error) {
       // Logging failure should not block the external notification action.
+      console.warn('Notification action logging failed:', error);
     }
   };
 
@@ -2562,7 +2614,8 @@ function App() {
 
       setArchivedHistoryData(result as ArchivedCaseHistory);
       setStatusMessage(`Loaded archived history for ${archivedHistoryMonth}.`);
-    } catch {
+    } catch (error) {
+      console.error('Load archived history failed:', error);
       setStatusMessage('Unable to connect to the server for archived history.');
       setArchivedHistoryData(null);
     } finally {
@@ -2587,7 +2640,8 @@ function App() {
       }
 
       setArchiveAnalyticsData(result as ArchiveAnalyticsData);
-    } catch {
+    } catch (error) {
+      console.error('Load archive analytics failed:', error);
       setStatusMessage('Unable to connect to the server for archive analytics.');
     } finally {
       setArchiveAnalyticsLoading(false);
@@ -2631,7 +2685,8 @@ function App() {
       setPurgeConfirmText('');
       setPurgeReady(false);
       setArchivedHistoryData(null);
-    } catch {
+    } catch (error) {
+      console.error('Purge archived history failed:', error);
       setStatusMessage('Unable to connect to the server for purge.');
     } finally {
       setPurgeArchivedLoading(false);
@@ -3048,7 +3103,8 @@ function App() {
 
       setStatusMessage(result.message || `Archived ${archiveMonth} history for ${client.name}.`);
       await loadDashboard();
-    } catch {
+    } catch (error) {
+      console.error('Archive client month failed:', error);
       setStatusMessage('Unable to connect to the server for archiving.');
     }
   };
@@ -3340,7 +3396,8 @@ function App() {
                   try {
                     await navigator.clipboard.writeText(item.phone || '');
                     setStatusMessage(`Copied ${item.name}'s phone number.`);
-                  } catch {
+                  } catch (error) {
+                    console.error('Copy phone number failed:', error);
                     setStatusMessage('Unable to copy phone number.');
                   }
                 }}
@@ -3376,7 +3433,8 @@ function App() {
                 try {
                   await navigator.clipboard.writeText(item.phone || '');
                   setStatusMessage(`Copied ${item.name}'s phone number.`);
-                } catch {
+                } catch (error) {
+                  console.error('Copy phone number failed:', error);
                   setStatusMessage('Unable to copy phone number.');
                 }
               }}

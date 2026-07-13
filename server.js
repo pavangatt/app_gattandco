@@ -3242,7 +3242,8 @@ app.post('/api/location', async (req, res) => {
       throwIfError(updateError, 'Unable to update visit location');
     }
   } catch (error) {
-    console.error('Location update warning:', error);
+    console.error('Location update failed:', error);
+    return res.status(500).json({ message: error.message || 'Unable to update location.' });
   }
 
   return res.json({ currentLocation: currentLocations[String(buddy_id)] });
