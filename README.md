@@ -65,6 +65,17 @@ PORT=5000
 
 4. In Supabase SQL Editor, run the contents of [supabase-schema.sql](supabase-schema.sql).
 
+For existing deployments that already ran the base schema, also run these additive migrations in Supabase SQL Editor:
+- [supabase-user-address-migration.sql](supabase-user-address-migration.sql)
+- [supabase-userid-credentials-migration.sql](supabase-userid-credentials-migration.sql)
+- [supabase-client-family-contacts-migration.sql](supabase-client-family-contacts-migration.sql)
+- [supabase-assignment-structure-migration.sql](supabase-assignment-structure-migration.sql)
+- [supabase-request-status-workflow-migration.sql](supabase-request-status-workflow-migration.sql)
+- [supabase-assignment-approval-workflow-migration.sql](supabase-assignment-approval-workflow-migration.sql)
+- [supabase-assignment-lifecycle-archive-migration.sql](supabase-assignment-lifecycle-archive-migration.sql)
+- [supabase-long-term-daily-records-migration.sql](supabase-long-term-daily-records-migration.sql)
+- [supabase-reminder-automation-migration.sql](supabase-reminder-automation-migration.sql)
+
 This schema includes:
 - Role-based users (`admin`, `buddy`, `client`)
 - Elderly profiles and client visibility mapping
@@ -96,6 +107,21 @@ npm run dev
 ```
 
 The backend now uses Supabase Postgres via `@supabase/supabase-js`.
+
+Location visibility guard:
+- Use `GET /api/location/current?assignment_id=...` for map-ready location reads.
+- The endpoint returns location only when the assignment is active and approved.
+
+Reminder automation:
+- Configure reminder switches using `GET /api/reminders/config` and `PUT /api/reminders/config` (admin).
+- Trigger cron-compatible D-1 reminder generation with `POST /api/reminders/run`.
+- For scheduler calls without admin session, send `x-reminder-secret: <REMINDER_RUNNER_SECRET>`.
+
+Calendar and monthly differences reporting:
+- Monthly differences summary API: `GET /api/reports/monthly-summary?month=YYYY-MM`.
+- Calendar aggregation API: `GET /api/reports/calendar?month=YYYY-MM`.
+- Optional filters on both endpoints: `buddy_id`, `client_id`, `status`, `mode` (`short_term` or `long_term`).
+- Responses reconcile planned/completed, rescheduled, missed, reminders sent, short-term package utilization, and long-term slot utilization.
 
 ## Build for production
 
