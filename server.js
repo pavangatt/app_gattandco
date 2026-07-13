@@ -1030,7 +1030,7 @@ app.post('/api/login', async (req, res) => {
 
 app.get('/api/session', (req, res) => {
   if (!req.session.user) {
-    return res.status(401).json({ message: 'No active session.' });
+    return res.json({ user: null });
   }
   return res.json({ user: req.session.user });
 });

@@ -667,12 +667,15 @@ function App() {
       try {
         const response = await fetch('/api/session');
         if (!response.ok) {
-          throw new Error('No active session');
+          throw new Error('Unable to verify session');
         }
         const result = await response.json();
         if (result?.user) {
           setUser(result.user as User);
           sessionStorage.setItem('gatt_user', JSON.stringify(result.user));
+        } else {
+          setUser(null);
+          sessionStorage.removeItem('gatt_user');
         }
       } catch {
         setUser(null);
