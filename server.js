@@ -11,12 +11,36 @@ import fs from 'fs';
 dotenv.config();
 
 const app = express();
-app.use(cors());
+
+const devCorsOrigins =
+  process.env.NODE_ENV === 'production' ? [] : ['http://localhost:5173', 'http://localhost:5000'];
+const configuredCorsOrigins = String(process.env.CORS_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const allowedCorsOrigins = Array.from(new Set([...devCorsOrigins, ...configuredCorsOrigins]));
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Requests without an Origin header (same-origin, curl, server-to-server) are allowed.
+      if (!origin || allowedCorsOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error('Origin not allowed by CORS policy.'));
+    },
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 const MemoryStore = createMemoryStore(session);
 
 const sessionSecret = process.env.SESSION_SECRET || 'change-me-in-production';
+if (process.env.NODE_ENV === 'production' && (!process.env.SESSION_SECRET || sessionSecret === 'change-me-in-production')) {
+  console.error('SESSION_SECRET must be set to a strong, random value in production.');
+  process.exit(1);
+}
 app.use(
   session({
     store: new MemoryStore({
@@ -905,6 +929,28 @@ async function initializeApp() {
 
 initializeApp();
 
+const PUBLIC_API_PATHS = new Set([
+  '/api/login',
+  '/api/register',
+  '/api/health',
+  '/api/session',
+  // Has its own admin-session-or-shared-secret authorization.
+  '/api/reminders/run',
+]);
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) {
+    return next();
+  }
+  if (PUBLIC_API_PATHS.has(req.path)) {
+    return next();
+  }
+  if (!req.session.user) {
+    return res.status(401).json({ message: 'Login required.' });
+  }
+  return next();
+});
+
 app.post('/api/register', async (req, res, next) => {
   const { name, email, phone, password } = req.body;
 
@@ -1024,7 +1070,7 @@ app.post('/api/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error.message, error.stack);
-    return res.status(500).json({ message: 'Login failed.', error: error.message });
+    return res.status(500).json({ message: 'Login failed.' });
   }
 });
 
@@ -4692,7 +4738,7 @@ app.use((err, req, res, next) => {
   const log = `Unhandled error: ${new Date().toISOString()} ${err.stack || err.message || err}\n`;
   fs.appendFileSync(path.resolve(process.cwd(), 'unhandled-error.log'), log);
   console.error(log);
-  res.status(500).json({ message: 'Internal server error', error: err?.message || 'unknown' });
+  res.status(500).json({ message: 'Internal server error' });
 });
 
 const distPath = path.resolve(process.cwd(), 'dist');
@@ -4711,6 +4757,9 @@ if (fs.existsSync(distPath)) {
     const match = req.path.match(/^\/dist\/(.*)$/);
     const relativePath = match && match[1] ? match[1] : '';
     const filePath = path.resolve(distPath, relativePath);
+    if (filePath !== distPath && !filePath.startsWith(distPath + path.sep)) {
+      return res.status(403).end();
+    }
     if (fs.existsSync(filePath)) {
       return res.sendFile(filePath);
     }
