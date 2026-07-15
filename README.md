@@ -81,6 +81,9 @@ For a clean demo reset with minimal data, run:
 
 This script truncates operational tables and recreates a compact valid dataset for flow testing.
 
+For an admin-only reset (delete all data and keep only one admin account), run:
+- [supabase-reset-admin-only.sql](supabase-reset-admin-only.sql)
+
 This schema includes:
 - Role-based users (`admin`, `buddy`, `client`)
 - Elderly profiles and client visibility mapping

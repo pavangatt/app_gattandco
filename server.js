@@ -86,6 +86,39 @@ function throwIfError(error, context) {
   }
 }
 
+function buildHttpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+async function recordAssignmentLifecycleAudit(payload, context) {
+  const normalizedPayload = {
+    ...payload,
+    notes: String(payload.notes || '').trim(),
+  };
+
+  const { error } = await supabase.from('assignment_lifecycle_audits').insert(normalizedPayload);
+  if (!error) {
+    return true;
+  }
+
+  console.warn(`${context} lifecycle audit insert failed:`, error.message);
+
+  if (Object.prototype.hasOwnProperty.call(normalizedPayload, 'notes')) {
+    const fallbackPayload = { ...normalizedPayload };
+    delete fallbackPayload.notes;
+    const { error: fallbackError } = await supabase.from('assignment_lifecycle_audits').insert(fallbackPayload);
+    if (!fallbackError) {
+      console.warn(`${context} lifecycle audit fallback succeeded without notes.`);
+      return true;
+    }
+    console.warn(`${context} lifecycle audit fallback failed:`, fallbackError.message);
+  }
+
+  return false;
+}
+
 function ensureAdminSession(req, res) {
   if (!req.session.user) {
     res.status(401).json({ message: 'Login required.' });
@@ -104,6 +137,16 @@ function normalizePhone(phone) {
   return String(phone || '').replace(/\D/g, '');
 }
 
+function isValidEmailAddress(email) {
+  const normalized = String(email || '').trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
+}
+
+function isValidSupportedPhoneNumber(phone) {
+  const digitsOnly = normalizePhone(phone);
+  return digitsOnly.length >= 10;
+}
+
 function normalizeUserId(value) {
   const normalized = String(value || '')
     .toLowerCase()
@@ -119,6 +162,7 @@ const ASSIGNMENT_STATUSES = new Set(['active', 'paused', 'completed', 'cancelled
 const CARE_SHIFTS = new Set(['morning_10h', 'night_10h', 'full_day']);
 const MONTHLY_VISIT_PLAN_VALUES = new Set([3, 6, 9]);
 const PLANNED_VISIT_DURATION_VALUES = new Set([60, 90]);
+const SHORT_TERM_REST_GAP_MINUTES = 240;
 const REQUEST_STATUS_VALUES = new Set(['new', 'viewed', 'read', 'awaiting_assignee', 'assigned', 'resolved', 'closed']);
 const REMINDER_TEMPLATE_KEYS = new Set(['visit_reminder_d1', 'backfilled_visit_notice', 'family_monthly_update']);
 const DEFAULT_REMINDER_SETTINGS = {
@@ -195,6 +239,292 @@ function normalizeDateOnly(value, fallback = null) {
     throw new Error('Date must use YYYY-MM-DD format.');
   }
   return text;
+}
+
+function normalizeTimeOnly(value) {
+  const text = String(value || '').trim();
+  if (!/^\d{2}:\d{2}$/.test(text)) {
+    throw new Error('Time must use HH:MM format (24-hour).');
+  }
+
+  const [hoursText, minutesText] = text.split(':');
+  const hours = Number(hoursText);
+  const minutes = Number(minutesText);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+    throw new Error('Time must use HH:MM format (24-hour).');
+  }
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+}
+
+function buildUtcMs(dateOnly, timeOnly) {
+  const ms = Date.parse(`${dateOnly}T${timeOnly}:00.000Z`);
+  if (!Number.isFinite(ms)) {
+    throw new Error('Invalid date/time value provided.');
+  }
+  return ms;
+}
+
+function normalizeShortTermSlots(rawSlots, expectedCount, durationMinutes) {
+  if (!Array.isArray(rawSlots)) {
+    throw buildHttpError(400, `Provide exactly ${expectedCount} short-term visit slots.`);
+  }
+
+  if (rawSlots.length !== expectedCount) {
+    throw buildHttpError(400, `Select exactly ${expectedCount} visit date and start-time slots.`);
+  }
+
+  const normalizedSlots = [];
+  const dateSet = new Set();
+  for (const slot of rawSlots) {
+    const visitDate = normalizeDateOnly(slot?.visit_date || slot?.date || null, null);
+    const startTime = normalizeTimeOnly(slot?.start_time || slot?.time || '');
+    if (!visitDate) {
+      throw buildHttpError(400, 'Each short-term slot requires a visit date.');
+    }
+
+    if (dateSet.has(visitDate)) {
+      throw buildHttpError(400, 'Short-term visit dates must be unique.');
+    }
+    dateSet.add(visitDate);
+
+    const startMs = buildUtcMs(visitDate, startTime);
+    const endMs = startMs + (durationMinutes * 60 * 1000);
+    const endIso = new Date(endMs).toISOString();
+    const endTime = endIso.slice(11, 16);
+
+    normalizedSlots.push({
+      visit_date: visitDate,
+      start_time: startTime,
+      end_time: endTime,
+      start_at: new Date(startMs).toISOString(),
+      end_at: new Date(endMs).toISOString(),
+      start_ms: startMs,
+      end_ms: endMs,
+    });
+  }
+
+  normalizedSlots.sort((a, b) => a.start_ms - b.start_ms);
+  const requiredGapMs = SHORT_TERM_REST_GAP_MINUTES * 60 * 1000;
+  for (let i = 1; i < normalizedSlots.length; i += 1) {
+    const previous = normalizedSlots[i - 1];
+    const current = normalizedSlots[i];
+    if (current.start_ms - previous.end_ms < requiredGapMs) {
+      throw buildHttpError(409, `Keep at least ${SHORT_TERM_REST_GAP_MINUTES / 60} hours rest gap between selected short-term slots.`);
+    }
+  }
+
+  return normalizedSlots;
+}
+
+async function assertNoLongTermConflictForBuddy(buddyId, elderlyId, excludeAssignmentId = null) {
+  let query = supabase
+    .from('assignments')
+    .select('id')
+    .eq('buddy_id', Number(buddyId))
+    .eq('service_plan_type', 'long_term')
+    .is('archived_at', null)
+    .neq('elderly_id', Number(elderlyId))
+    .not('status', 'in', '(completed,cancelled)')
+    .limit(1);
+
+  if (excludeAssignmentId) {
+    query = query.neq('id', Number(excludeAssignmentId));
+  }
+
+  const { data: existingLongTerm, error } = await query.maybeSingle();
+  throwIfError(error, 'Unable to validate long-term caretaker exclusivity');
+
+  if (existingLongTerm?.id) {
+    throw buildHttpError(409, 'This caretaker already has another long-term client assignment. Choose a different caretaker.');
+  }
+}
+
+async function assertRestGapForShortTermSlots(buddyId, normalizedSlots, excludeAssignmentId = null) {
+  if (!Array.isArray(normalizedSlots) || normalizedSlots.length === 0) {
+    return;
+  }
+
+  let assignmentQuery = supabase
+    .from('assignments')
+    .select('id')
+    .eq('buddy_id', Number(buddyId))
+    .eq('service_plan_type', 'short_term')
+    .is('archived_at', null)
+    .not('status', 'in', '(completed,cancelled)');
+
+  if (excludeAssignmentId) {
+    assignmentQuery = assignmentQuery.neq('id', Number(excludeAssignmentId));
+  }
+
+  const { data: assignmentRows, error: assignmentRowsError } = await assignmentQuery;
+  throwIfError(assignmentRowsError, 'Unable to validate buddy short-term assignments');
+
+  const assignmentIds = (assignmentRows || []).map((entry) => entry.id);
+  if (assignmentIds.length === 0) {
+    return;
+  }
+
+  const { data: existingSlots, error: existingSlotsError } = await supabase
+    .from('short_term_visit_slots')
+    .select('start_at, end_at')
+    .in('assignment_id', assignmentIds)
+    .order('start_at', { ascending: true });
+  throwIfError(existingSlotsError, 'Unable to validate short-term rest window');
+
+  const requiredGapMs = SHORT_TERM_REST_GAP_MINUTES * 60 * 1000;
+  for (const candidate of normalizedSlots) {
+    const candidateStartMs = candidate.start_ms;
+    const candidateEndMs = candidate.end_ms;
+    for (const existing of existingSlots || []) {
+      const existingStartMs = Date.parse(String(existing.start_at || ''));
+      const existingEndMs = Date.parse(String(existing.end_at || ''));
+      if (!Number.isFinite(existingStartMs) || !Number.isFinite(existingEndMs)) {
+        continue;
+      }
+
+      if (candidateStartMs < existingEndMs && existingStartMs < candidateEndMs) {
+        throw buildHttpError(409, 'Selected short-term slot overlaps with an existing assignment slot for this caretaker.');
+      }
+
+      if (candidateStartMs >= existingEndMs && (candidateStartMs - existingEndMs) < requiredGapMs) {
+        throw buildHttpError(409, `Caretaker needs at least ${SHORT_TERM_REST_GAP_MINUTES / 60} hours rest after a previous assignment.`);
+      }
+
+      if (existingStartMs >= candidateEndMs && (existingStartMs - candidateEndMs) < requiredGapMs) {
+        throw buildHttpError(409, `Caretaker needs at least ${SHORT_TERM_REST_GAP_MINUTES / 60} hours rest before the next assignment.`);
+      }
+    }
+  }
+}
+
+async function createShortTermVisitsForAssignment(assignmentId) {
+  const { data: assignment, error: assignmentError } = await supabase
+    .from('assignments')
+    .select('id, buddy_id, elderly_id, service_plan_type, term_type, monthly_visit_plan, planned_visit_duration_minutes')
+    .eq('id', Number(assignmentId))
+    .single();
+  throwIfError(assignmentError, 'Unable to load assignment for short-term visit generation');
+
+  const effectiveServicePlanType = normalizeServicePlanType(assignment.service_plan_type, assignment.term_type);
+  if (effectiveServicePlanType !== 'short_term') {
+    return 0;
+  }
+
+  const { data: slots, error: slotsError } = await supabase
+    .from('short_term_visit_slots')
+    .select('visit_date, start_time')
+    .eq('assignment_id', Number(assignmentId))
+    .order('visit_date', { ascending: true })
+    .order('start_time', { ascending: true });
+  throwIfError(slotsError, 'Unable to load short-term visit slots');
+
+  if (!Array.isArray(slots) || slots.length === 0) {
+    return 0;
+  }
+
+  const { data: existingVisits, error: existingVisitsError } = await supabase
+    .from('visits')
+    .select('scheduled_date')
+    .eq('assignment_id', Number(assignmentId));
+  throwIfError(existingVisitsError, 'Unable to check existing assignment visits');
+
+  const existingByDate = new Set((existingVisits || []).map((entry) => String(entry.scheduled_date || '')));
+  const toInsert = [];
+  for (const slot of slots) {
+    const scheduledDate = String(slot.visit_date || '').slice(0, 10);
+    if (!scheduledDate || existingByDate.has(scheduledDate)) {
+      continue;
+    }
+
+    const note = `Planned slot ${String(slot.start_time || '').slice(0, 5)} • ${assignment.planned_visit_duration_minutes || 60} min`;
+    toInsert.push({
+      buddy_id: Number(assignment.buddy_id),
+      elderly_id: Number(assignment.elderly_id),
+      assignment_id: Number(assignmentId),
+      scheduled_date: scheduledDate,
+      visit_status: 'scheduled',
+      status_check: null,
+      buddy_notes: note,
+    });
+  }
+
+  if (toInsert.length === 0) {
+    return 0;
+  }
+
+  const { error: insertError } = await supabase.from('visits').insert(toInsert);
+  throwIfError(insertError, 'Unable to create short-term scheduled visits');
+
+  return toInsert.length;
+}
+
+async function syncScheduledVisitsForShortTermAssignment({
+  assignmentId,
+  buddyId,
+  elderlyId,
+  plannedVisitDurationMinutes,
+  normalizedShortTermSlots,
+}) {
+  const duration = Number(plannedVisitDurationMinutes) || 60;
+  const sortedSlots = [...(normalizedShortTermSlots || [])].sort((a, b) => a.start_ms - b.start_ms);
+
+  const { data: scheduledVisits, error: scheduledVisitsError } = await supabase
+    .from('visits')
+    .select('id, scheduled_date')
+    .eq('assignment_id', Number(assignmentId))
+    .eq('visit_status', 'scheduled')
+    .order('scheduled_date', { ascending: true })
+    .order('id', { ascending: true });
+  throwIfError(scheduledVisitsError, 'Unable to load scheduled visits for slot synchronization');
+
+  const existingScheduledVisits = scheduledVisits || [];
+  const overlapCount = Math.min(existingScheduledVisits.length, sortedSlots.length);
+
+  for (let index = 0; index < overlapCount; index += 1) {
+    const visit = existingScheduledVisits[index];
+    const slot = sortedSlots[index];
+    const scheduledDate = String(slot.visit_date || '').slice(0, 10);
+    const note = `Planned slot ${String(slot.start_time || '').slice(0, 5)} • ${duration} min`;
+
+    const { error: updateVisitError } = await supabase
+      .from('visits')
+      .update({
+        buddy_id: Number(buddyId),
+        elderly_id: Number(elderlyId),
+        scheduled_date: scheduledDate,
+        buddy_notes: note,
+      })
+      .eq('id', Number(visit.id));
+    throwIfError(updateVisitError, 'Unable to update scheduled visit during slot synchronization');
+  }
+
+  if (sortedSlots.length > existingScheduledVisits.length) {
+    const visitsToInsert = sortedSlots.slice(existingScheduledVisits.length).map((slot) => ({
+      buddy_id: Number(buddyId),
+      elderly_id: Number(elderlyId),
+      assignment_id: Number(assignmentId),
+      scheduled_date: String(slot.visit_date || '').slice(0, 10),
+      visit_status: 'scheduled',
+      status_check: null,
+      buddy_notes: `Planned slot ${String(slot.start_time || '').slice(0, 5)} • ${duration} min`,
+    }));
+
+    const { error: insertVisitsError } = await supabase
+      .from('visits')
+      .insert(visitsToInsert);
+    throwIfError(insertVisitsError, 'Unable to create scheduled visits during slot synchronization');
+  }
+
+  if (existingScheduledVisits.length > sortedSlots.length) {
+    const visitIdsToDelete = existingScheduledVisits.slice(sortedSlots.length).map((visit) => Number(visit.id));
+    if (visitIdsToDelete.length > 0) {
+      const { error: deleteVisitsError } = await supabase
+        .from('visits')
+        .delete()
+        .in('id', visitIdsToDelete);
+      throwIfError(deleteVisitsError, 'Unable to delete extra scheduled visits during slot synchronization');
+    }
+  }
 }
 
 function ensureAdminOrBuddySession(req, res) {
@@ -797,101 +1127,6 @@ async function ensureTask(visitId, taskName, status, measuredValue, buddyRemarks
   throwIfError(error, 'Unable to create task');
 }
 
-async function seedDefaultUsers() {
-  const clientNames = ['client1', 'client2', 'client3', 'client4', 'client5'];
-  const buddyNames = ['buddy1', 'buddy2', 'buddy3', 'buddy4', 'buddy5'];
-
-  await ensureUser({ user_id: 'admin', email: 'admin@gattandco.local', full_name: 'Admin', role: 'admin', password: '1234567890' });
-
-  for (const clientName of clientNames) {
-    await ensureUser({
-      user_id: clientName,
-      email: `${clientName}@gattandco.local`,
-      full_name: clientName,
-      role: 'client',
-      password: '1234567890',
-    });
-  }
-
-  for (const buddyName of buddyNames) {
-    await ensureUser({
-      user_id: buddyName,
-      email: `${buddyName}@gattandco.local`,
-      full_name: buddyName,
-      role: 'buddy',
-      password: '1234567890',
-    });
-  }
-
-  const { data: clientRows, error: clientError } = await supabase.from('users').select('id, full_name').eq('role', 'client');
-  throwIfError(clientError, 'Unable to load clients for seed');
-  const { data: elderlyRows, error: elderlyError } = await supabase.from('elderly_members').select('id, client_id');
-  throwIfError(elderlyError, 'Unable to load elderly members for seed');
-  const { data: buddyRows, error: buddyError } = await supabase.from('users').select('id, full_name').eq('role', 'buddy');
-  throwIfError(buddyError, 'Unable to load buddies for seed');
-
-  const elderlyByClient = {};
-  for (const member of elderlyRows || []) {
-    elderlyByClient[member.client_id] = member.id;
-  }
-
-  const clientMap = Array.isArray(clientRows)
-    ? clientRows.map((row) => ({ ...row, elderly_id: elderlyByClient[row.id] || null }))
-    : [];
-  const buddyMap = Array.isArray(buddyRows) ? buddyRows : [];
-
-  for (let index = 0; index < clientMap.length && index < buddyMap.length; index += 1) {
-    const client = clientMap[index];
-    const buddy = buddyMap[index];
-    if (!client || !client.elderly_id) {
-      continue;
-    }
-    await ensureAssignment(buddy.id, client.elderly_id, {
-      status: index % 2 === 0 ? 'active' : 'active',
-      scheduledDate: new Date(Date.now() - index * 86400000).toISOString().slice(0, 10),
-      arrivalTime: new Date(Date.now() - 3600000).toISOString(),
-      arrivalLatLng: `${12.97 + index * 0.01},${77.59 + index * 0.01}`,
-      statusCheck: ['Excellent', 'Good', 'Weak'][index % 3],
-      buddyNotes: `Checking on ${client.full_name} and updating care plan.`,
-      term: index % 2 === 0 ? 'long' : 'short',
-    });
-  }
-
-  const { data: visitRows, error: visitError } = await supabase.from('visits').select('id, buddy_id, elderly_id').order('id', { ascending: true });
-  throwIfError(visitError, 'Unable to load visits for seed');
-  if (Array.isArray(visitRows)) {
-    const tasksData = [
-      [
-        { task_name: 'Medication check', status: 'completed', measured_value: 'OK', buddy_remarks: 'All meds administered' },
-        { task_name: 'Mobility assistance', status: 'pending', measured_value: '', buddy_remarks: 'Patient needs help walking' },
-      ],
-      [
-        { task_name: 'Blood pressure', status: 'pending', measured_value: '130/80', buddy_remarks: 'Awaiting doctor review' },
-        { task_name: 'Hydration check', status: 'completed', measured_value: '500ml', buddy_remarks: 'Water provided' },
-      ],
-      [
-        { task_name: 'Meal support', status: 'completed', measured_value: 'Served', buddy_remarks: 'Ate well' },
-        { task_name: 'Medication reminder', status: 'pending', measured_value: '', buddy_remarks: 'Remind at 6 PM' },
-      ],
-      [
-        { task_name: 'Personal hygiene', status: 'carried_forward', measured_value: '', buddy_remarks: 'Need more time for bath' },
-        { task_name: 'Exercise support', status: 'pending', measured_value: '', buddy_remarks: 'Gentle stretching' },
-      ],
-      [
-        { task_name: 'Medication check', status: 'pending', measured_value: 'OK', buddy_remarks: 'Prepare evening meds' },
-        { task_name: 'Vitals monitoring', status: 'completed', measured_value: 'Stable', buddy_remarks: 'Heart rate OK' },
-      ],
-    ];
-
-    for (let index = 0; index < visitRows.length; index += 1) {
-      const visit = visitRows[index];
-      const tasksForVisit = tasksData[index % tasksData.length];
-      for (const task of tasksForVisit) {
-        await ensureTask(visit.id, task.task_name, task.status, task.measured_value, task.buddy_remarks);
-      }
-    }
-  }
-}
 
 async function initializeApp() {
   try {
@@ -1084,26 +1319,43 @@ app.get('/api/users', async (req, res) => {
 app.post('/api/users', async (req, res) => {
   const { user_id, name, email, phone, address, role, password, client_onboarding_type } = req.body;
 
-  if (!user_id || !name || !role || !password) {
-    return res.status(400).json({ message: 'User ID, name, role and password are required.' });
+  const trimmedUserId = String(user_id || '').trim();
+  const trimmedName = String(name || '').trim();
+  const trimmedEmail = String(email || '').trim().toLowerCase();
+  const trimmedPhone = String(phone || '').trim();
+  const trimmedAddress = String(address || '').trim();
+  const trimmedPassword = String(password || '');
+
+  if (!trimmedUserId || !trimmedName || !role || !trimmedEmail || !trimmedPhone || !trimmedAddress || !trimmedPassword) {
+    return res.status(400).json({ message: 'User ID, name, email, phone, address, role, and password are required.' });
   }
 
   if (role !== 'buddy' && role !== 'client') {
     return res.status(400).json({ message: 'Role must be buddy or client.' });
   }
 
+  if (role === 'client' && !String(client_onboarding_type || '').trim()) {
+    return res.status(400).json({ message: 'Client onboarding type is required for client accounts.' });
+  }
+
+  if (!isValidEmailAddress(trimmedEmail)) {
+    return res.status(400).json({ message: 'Enter a valid email address.' });
+  }
+
+  if (!isValidSupportedPhoneNumber(trimmedPhone)) {
+    return res.status(400).json({ message: 'Enter a phone number with at least 10 digits.' });
+  }
+
   try {
-    const normalizedEmail = email || `${name.toLowerCase().replace(/\s+/g, '')}@gattandco.local`;
-    const trimmedAddress = typeof address === 'string' ? address.trim() : '';
     const userId = await ensureUser({
-      user_id,
-      email: normalizedEmail,
-      full_name: name,
-      phone: phone || '',
+      user_id: trimmedUserId,
+      email: trimmedEmail,
+      full_name: trimmedName,
+      phone: trimmedPhone,
       address: trimmedAddress,
       client_onboarding_type,
       role,
-      password,
+      password: trimmedPassword,
       allowExisting: false,
     });
 
@@ -1125,6 +1377,46 @@ app.post('/api/users', async (req, res) => {
       return res.status(409).json({ message: 'User ID, email, or phone already exists.' });
     }
     return res.status(500).json({ message: 'Unable to create user.' });
+  }
+});
+
+app.delete('/api/users/:id', async (req, res) => {
+  if (!ensureAdminSession(req, res)) {
+    return;
+  }
+
+  const userId = Number(req.params.id);
+  if (!Number.isFinite(userId) || userId <= 0) {
+    return res.status(400).json({ message: 'Valid user id is required.' });
+  }
+
+  try {
+    const { data: userRow, error: userError } = await supabase
+      .from('users')
+      .select('id, role, full_name')
+      .eq('id', userId)
+      .single();
+    throwIfError(userError, 'Unable to load user for deletion');
+
+    if (!userRow) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    if (userRow.role === 'admin') {
+      return res.status(400).json({ message: 'Admin users cannot be deleted from this screen.' });
+    }
+
+    const { error: deleteError } = await supabase
+      .from('users')
+      .delete()
+      .eq('id', userId);
+    throwIfError(deleteError, 'Unable to delete user');
+
+    const roleLabel = userRow.role === 'buddy' ? 'Caretaker' : 'Client';
+    return res.json({ message: `${roleLabel} ${userRow.full_name || ''} deleted.`.trim() });
+  } catch (error) {
+    console.error('Delete user failed:', error);
+    return res.status(500).json({ message: error.message || 'Unable to delete user.' });
   }
 });
 
@@ -2275,6 +2567,7 @@ app.get('/api/assignments', async (req, res) => {
 
     const assignmentIds = (assignments || []).map((item) => item.id);
     const serviceRowsByAssignmentId = {};
+    const shortTermSlotsByAssignmentId = {};
     if (assignmentIds.length > 0) {
       const { data: serviceRows, error: serviceRowsError } = await supabase
         .from('care_plan_services')
@@ -2289,6 +2582,34 @@ app.get('/api/assignments', async (req, res) => {
         }
         serviceRowsByAssignmentId[row.assignment_id].push(row);
       }
+
+      const { data: shortTermSlotRows, error: shortTermSlotRowsError } = await supabase
+        .from('short_term_visit_slots')
+        .select('id, assignment_id, visit_date, start_time, end_time, start_at, end_at')
+        .in('assignment_id', assignmentIds)
+        .order('visit_date', { ascending: true })
+        .order('start_time', { ascending: true });
+
+      if (shortTermSlotRowsError) {
+        const normalizedMessage = String(shortTermSlotRowsError.message || '').toLowerCase();
+        const missingTable = normalizedMessage.includes('short_term_visit_slots')
+          && (
+            normalizedMessage.includes('does not exist')
+            || normalizedMessage.includes('relation')
+            || normalizedMessage.includes('could not find the table')
+            || normalizedMessage.includes('schema cache')
+          );
+        if (!missingTable) {
+          throwIfError(shortTermSlotRowsError, 'Unable to fetch short-term visit slots');
+        }
+      } else {
+        for (const row of shortTermSlotRows || []) {
+          if (!shortTermSlotsByAssignmentId[row.assignment_id]) {
+            shortTermSlotsByAssignmentId[row.assignment_id] = [];
+          }
+          shortTermSlotsByAssignmentId[row.assignment_id].push(row);
+        }
+      }
     }
 
     const userMap = await fetchUsersMapById((assignments || []).map((item) => item.buddy_id));
@@ -2301,6 +2622,7 @@ app.get('/api/assignments', async (req, res) => {
       age: elderlyMap[assignment.elderly_id]?.age ?? null,
       address: elderlyMap[assignment.elderly_id]?.address ?? '',
       services: serviceRowsByAssignmentId[assignment.id] || [],
+      short_term_slots: shortTermSlotsByAssignmentId[assignment.id] || [],
     }));
 
     return res.json(rows);
@@ -2320,10 +2642,10 @@ app.post('/api/assignments', async (req, res) => {
     care_shift,
     monthly_visit_plan,
     planned_visit_duration_minutes,
+    short_term_slots,
     service_for_client_id,
     start_date,
     end_date,
-    extension_end_date,
     services,
     admin_notes,
   } = req.body;
@@ -2342,12 +2664,9 @@ app.post('/api/assignments', async (req, res) => {
     const effectiveServices = normalizeServiceCodes(services);
     const effectiveStartDate = normalizeDateOnly(start_date, new Date().toISOString().slice(0, 10));
     const effectiveEndDate = normalizeDateOnly(end_date, null);
-    const effectiveExtensionEndDate = extension_end_date ? String(extension_end_date).trim() : null;
+    const effectiveExtensionEndDate = null;
     const trimmedAdminNotes = String(admin_notes || '').trim();
-
-    if (effectiveServices.length === 0) {
-      return res.status(400).json({ message: 'Select at least one care plan service.' });
-    }
+    let normalizedShortTermSlots = [];
 
     if (effectiveServicePlanType === 'short_term') {
       if (!MONTHLY_VISIT_PLAN_VALUES.has(effectiveMonthlyVisitPlan)) {
@@ -2359,6 +2678,9 @@ app.post('/api/assignments', async (req, res) => {
       if (effectiveCareShift) {
         return res.status(400).json({ message: 'Care shift applies only to long-term service.' });
       }
+
+      normalizedShortTermSlots = normalizeShortTermSlots(short_term_slots, effectiveMonthlyVisitPlan, effectiveVisitDuration);
+      await assertRestGapForShortTermSlots(Number(buddy_id), normalizedShortTermSlots);
     }
 
     if (effectiveServicePlanType === 'long_term') {
@@ -2374,9 +2696,8 @@ app.post('/api/assignments', async (req, res) => {
       if (effectiveEndDate < effectiveStartDate) {
         return res.status(400).json({ message: 'End date must be on or after start date for long-term service.' });
       }
-      if (effectiveExtensionEndDate && effectiveExtensionEndDate < effectiveEndDate) {
-        return res.status(400).json({ message: 'Extension end date must be on or after cycle end date.' });
-      }
+
+      await assertNoLongTermConflictForBuddy(Number(buddy_id), Number(elderly_id));
     }
 
     const { data: elderlyRecord, error: elderlyRecordError } = await supabase
@@ -2414,45 +2735,52 @@ app.post('/api/assignments', async (req, res) => {
     throwIfError(assignmentError, 'Unable to create assignment');
 
     const assignmentId = assignmentResult.id;
-    const { error: lifecycleAuditError } = await supabase.from('assignment_lifecycle_audits').insert({
+    if (effectiveServicePlanType === 'short_term' && normalizedShortTermSlots.length > 0) {
+      const { error: shortTermSlotsError } = await supabase.from('short_term_visit_slots').insert(
+        normalizedShortTermSlots.map((slot) => ({
+          assignment_id: assignmentId,
+          buddy_id: Number(buddy_id),
+          elderly_id: Number(elderly_id),
+          visit_date: slot.visit_date,
+          start_time: slot.start_time,
+          end_time: slot.end_time,
+          start_at: slot.start_at,
+          end_at: slot.end_at,
+        })),
+      );
+      throwIfError(shortTermSlotsError, 'Unable to save short-term visit slots');
+    }
+
+    await recordAssignmentLifecycleAudit({
       assignment_id: assignmentId,
       from_status: null,
       to_status: effectiveApprovalState,
       actor_user_id: req.session.user?.id || null,
       notes: trimmedAdminNotes || '',
-    });
-    throwIfError(lifecycleAuditError, 'Unable to create assignment lifecycle audit');
+    }, 'Create assignment');
 
-    const { error: serviceInsertError } = await supabase.from('care_plan_services').insert(
-      effectiveServices.map((serviceCode) => ({
-        assignment_id: assignmentId,
-        service_code: serviceCode,
-        service_name: getServiceName(serviceCode),
-        is_required: true,
-      })),
-    );
-    throwIfError(serviceInsertError, 'Unable to save care plan services');
+    if (effectiveServices.length > 0) {
+      const { error: serviceInsertError } = await supabase.from('care_plan_services').insert(
+        effectiveServices.map((serviceCode) => ({
+          assignment_id: assignmentId,
+          service_code: serviceCode,
+          service_name: getServiceName(serviceCode),
+          is_required: true,
+        })),
+      );
+      throwIfError(serviceInsertError, 'Unable to save care plan services');
+    }
 
     if (effectiveServicePlanType === 'short_term' && assignmentStatus === 'active') {
-      const scheduledDate = new Date().toISOString().slice(0, 10);
-      const note = `${effectiveMonthlyVisitPlan} visits/month • ${effectiveVisitDuration} min`;
-      const { error: visitError } = await supabase
-        .from('visits')
-        .insert({
-          buddy_id: Number(buddy_id),
-          elderly_id: Number(elderly_id),
-          assignment_id: assignmentId,
-          scheduled_date: scheduledDate,
-          visit_status: 'scheduled',
-          status_check: null,
-          buddy_notes: note,
-        });
-      throwIfError(visitError, 'Unable to create starter visit');
+      await createShortTermVisitsForAssignment(assignmentId);
     }
 
     return res.json({ message: 'Assignment created and pending approval.', id: assignmentId });
   } catch (error) {
     console.error('Create assignment failed:', error);
+    if (Number.isFinite(Number(error?.statusCode)) && Number(error.statusCode) >= 400 && Number(error.statusCode) < 500) {
+      return res.status(Number(error.statusCode)).json({ message: error.message || 'Unable to create assignment.' });
+    }
     return res.status(500).json({ message: error.message || 'Unable to create assignment.' });
   }
 });
@@ -2672,10 +3000,33 @@ app.post('/api/assignments/:id/approval-action', async (req, res) => {
   try {
     const { data: existingAssignment, error: existingAssignmentError } = await supabase
       .from('assignments')
-      .select('id, approval_state')
+      .select('id, buddy_id, elderly_id, service_plan_type, term_type, approval_state')
       .eq('id', assignmentId)
       .single();
     throwIfError(existingAssignmentError, 'Unable to load assignment for approval action');
+
+    if (nextApprovalState === 'approved') {
+      const servicePlanType = normalizeServicePlanType(existingAssignment.service_plan_type, existingAssignment.term_type);
+      if (servicePlanType === 'long_term') {
+        await assertNoLongTermConflictForBuddy(Number(existingAssignment.buddy_id), Number(existingAssignment.elderly_id), assignmentId);
+      }
+
+      const { data: activeConflict, error: activeConflictError } = await supabase
+        .from('assignments')
+        .select('id')
+        .eq('buddy_id', Number(existingAssignment.buddy_id))
+        .eq('elderly_id', Number(existingAssignment.elderly_id))
+        .eq('status', 'active')
+        .neq('id', assignmentId)
+        .is('archived_at', null)
+        .limit(1)
+        .maybeSingle();
+      throwIfError(activeConflictError, 'Unable to validate active assignment conflict');
+
+      if (activeConflict?.id) {
+        return res.status(409).json({ message: 'Another active assignment already exists for this caretaker and client. Pause or complete it before approving this one.' });
+      }
+    }
 
     const previousApprovalState = normalizeApprovalState(existingAssignment.approval_state || 'pending_approval');
     const { error: updateError } = await supabase
@@ -2687,18 +3038,24 @@ app.post('/api/assignments/:id/approval-action', async (req, res) => {
       .eq('id', assignmentId);
     throwIfError(updateError, 'Unable to update assignment approval state');
 
-    const { error: lifecycleAuditError } = await supabase.from('assignment_lifecycle_audits').insert({
+    await recordAssignmentLifecycleAudit({
       assignment_id: assignmentId,
       from_status: previousApprovalState,
       to_status: nextApprovalState,
       actor_user_id: req.session.user?.id || null,
       notes: String(notes || '').trim(),
-    });
-    throwIfError(lifecycleAuditError, 'Unable to record assignment lifecycle audit');
+    }, 'Assignment approval action');
+
+    if (nextApprovalState === 'approved') {
+      await createShortTermVisitsForAssignment(assignmentId);
+    }
 
     return res.json({ message: 'Assignment approval status updated.' });
   } catch (error) {
     console.error('Assignment approval action failed:', error);
+    if (Number.isFinite(Number(error?.statusCode)) && Number(error.statusCode) >= 400 && Number(error.statusCode) < 500) {
+      return res.status(Number(error.statusCode)).json({ message: error.message || 'Unable to update assignment approval status.' });
+    }
     return res.status(500).json({ message: error.message || 'Unable to update assignment approval status.' });
   }
 });
@@ -2720,7 +3077,7 @@ app.post('/api/assignments/:id/client-approve', async (req, res) => {
   try {
     const { data: assignmentRow, error: assignmentRowError } = await supabase
       .from('assignments')
-      .select('id, elderly_id, approval_state')
+      .select('id, buddy_id, elderly_id, service_plan_type, term_type, approval_state')
       .eq('id', assignmentId)
       .single();
     throwIfError(assignmentRowError, 'Unable to load assignment');
@@ -2738,25 +3095,350 @@ app.post('/api/assignments/:id/client-approve', async (req, res) => {
 
     const previousApprovalState = normalizeApprovalState(assignmentRow.approval_state || 'pending_approval');
 
+    const servicePlanType = normalizeServicePlanType(assignmentRow.service_plan_type, assignmentRow.term_type);
+    if (servicePlanType === 'long_term') {
+      await assertNoLongTermConflictForBuddy(Number(assignmentRow.buddy_id), Number(assignmentRow.elderly_id), assignmentId);
+    }
+
+    const { data: activeConflict, error: activeConflictError } = await supabase
+      .from('assignments')
+      .select('id')
+      .eq('buddy_id', Number(assignmentRow.buddy_id))
+      .eq('elderly_id', Number(assignmentRow.elderly_id))
+      .eq('status', 'active')
+      .neq('id', assignmentId)
+      .is('archived_at', null)
+      .limit(1)
+      .maybeSingle();
+    throwIfError(activeConflictError, 'Unable to validate active assignment conflict');
+
+    if (activeConflict?.id) {
+      return res.status(409).json({ message: 'Another active assignment already exists for this caretaker and client. Please contact admin to pause or complete the active one first.' });
+    }
+
     const { error: updateError } = await supabase
       .from('assignments')
       .update({ approval_state: 'approved', status: 'active' })
       .eq('id', assignmentId);
     throwIfError(updateError, 'Unable to approve assignment');
 
-    const { error: lifecycleAuditError } = await supabase.from('assignment_lifecycle_audits').insert({
+    await recordAssignmentLifecycleAudit({
       assignment_id: assignmentId,
       from_status: previousApprovalState,
       to_status: 'approved',
       actor_user_id: req.session.user?.id || null,
       notes: 'Client approved assignment.',
-    });
-    throwIfError(lifecycleAuditError, 'Unable to record assignment lifecycle audit');
+    }, 'Client assignment approval');
+
+    await createShortTermVisitsForAssignment(assignmentId);
 
     return res.json({ message: 'Assignment approved.' });
   } catch (error) {
     console.error('Client assignment approval failed:', error);
+    if (Number.isFinite(Number(error?.statusCode)) && Number(error.statusCode) >= 400 && Number(error.statusCode) < 500) {
+      return res.status(Number(error.statusCode)).json({ message: error.message || 'Unable to approve assignment.' });
+    }
     return res.status(500).json({ message: error.message || 'Unable to approve assignment.' });
+  }
+});
+
+app.post('/api/assignments/:id/switch-buddy', async (req, res) => {
+  if (!ensureAdminSession(req, res)) {
+    return;
+  }
+
+  const assignmentId = Number(req.params.id);
+  const newBuddyId = Number(req.body?.new_buddy_id);
+  const reason = String(req.body?.reason || '').trim();
+
+  if (!Number.isFinite(assignmentId) || assignmentId <= 0) {
+    return res.status(400).json({ message: 'Valid assignment id is required.' });
+  }
+
+  if (!Number.isFinite(newBuddyId) || newBuddyId <= 0) {
+    return res.status(400).json({ message: 'Valid replacement caretaker is required.' });
+  }
+
+  try {
+    const { data: assignmentRow, error: assignmentError } = await supabase
+      .from('assignments')
+      .select('id, buddy_id, elderly_id, service_plan_type, term_type, approval_state')
+      .eq('id', assignmentId)
+      .single();
+    throwIfError(assignmentError, 'Unable to load assignment for replacement');
+
+    const { data: elderlyRow, error: elderlyRowError } = await supabase
+      .from('elderly_members')
+      .select('id, client_id, full_name')
+      .eq('id', Number(assignmentRow.elderly_id))
+      .single();
+    throwIfError(elderlyRowError, 'Unable to load client profile for replacement notification');
+
+    const { data: currentBuddyRow, error: currentBuddyRowError } = await supabase
+      .from('users')
+      .select('id, full_name')
+      .eq('id', Number(assignmentRow.buddy_id))
+      .single();
+    throwIfError(currentBuddyRowError, 'Unable to load current caretaker details');
+
+    if (Number(assignmentRow.buddy_id) === newBuddyId) {
+      return res.status(400).json({ message: 'Select a different caretaker for replacement.' });
+    }
+
+    const { data: buddyRow, error: buddyRowError } = await supabase
+      .from('users')
+      .select('id, role, is_active, full_name')
+      .eq('id', newBuddyId)
+      .single();
+    throwIfError(buddyRowError, 'Unable to validate replacement caretaker');
+
+    if (buddyRow.role !== 'buddy' || buddyRow.is_active === false) {
+      return res.status(400).json({ message: 'Replacement user must be an active caretaker.' });
+    }
+
+    const servicePlanType = normalizeServicePlanType(assignmentRow.service_plan_type, assignmentRow.term_type);
+    if (servicePlanType === 'long_term') {
+      await assertNoLongTermConflictForBuddy(newBuddyId, Number(assignmentRow.elderly_id), assignmentId);
+    }
+
+    if (servicePlanType === 'short_term') {
+      const { data: existingSlots, error: existingSlotsError } = await supabase
+        .from('short_term_visit_slots')
+        .select('visit_date, start_time, end_time, start_at, end_at')
+        .eq('assignment_id', assignmentId)
+        .order('visit_date', { ascending: true })
+        .order('start_time', { ascending: true });
+      throwIfError(existingSlotsError, 'Unable to load assignment short-term slots');
+
+      const normalizedExistingSlots = (existingSlots || []).map((slot) => ({
+        visit_date: String(slot.visit_date || '').slice(0, 10),
+        start_time: String(slot.start_time || '').slice(0, 5),
+        end_time: String(slot.end_time || '').slice(0, 5),
+        start_at: slot.start_at,
+        end_at: slot.end_at,
+        start_ms: Date.parse(String(slot.start_at || '')),
+        end_ms: Date.parse(String(slot.end_at || '')),
+      }));
+
+      await assertRestGapForShortTermSlots(newBuddyId, normalizedExistingSlots, assignmentId);
+    }
+
+    const { error: updateAssignmentError } = await supabase
+      .from('assignments')
+      .update({ buddy_id: newBuddyId })
+      .eq('id', assignmentId);
+    throwIfError(updateAssignmentError, 'Unable to switch caretaker for assignment');
+
+    const { error: updateVisitsError } = await supabase
+      .from('visits')
+      .update({ buddy_id: newBuddyId })
+      .eq('assignment_id', assignmentId);
+    throwIfError(updateVisitsError, 'Unable to switch caretaker on scheduled visits');
+
+    const { error: updateSlotsError } = await supabase
+      .from('short_term_visit_slots')
+      .update({ buddy_id: newBuddyId })
+      .eq('assignment_id', assignmentId);
+    throwIfError(updateSlotsError, 'Unable to switch caretaker on short-term slots');
+
+    const currentApprovalState = normalizeApprovalState(assignmentRow.approval_state || 'pending_approval');
+    const replacementNote = `Caretaker switched from ${assignmentRow.buddy_id} to ${newBuddyId}${reason ? ` (${reason})` : ''}`;
+    await recordAssignmentLifecycleAudit({
+      assignment_id: assignmentId,
+      from_status: currentApprovalState,
+      to_status: currentApprovalState,
+      actor_user_id: req.session.user?.id || null,
+      notes: replacementNote,
+    }, servicePlanType === 'long_term' ? 'Long-term caretaker replacement' : 'Assignment caretaker switch');
+
+    let clientNotified = false;
+    if (servicePlanType === 'long_term' && Number.isFinite(Number(elderlyRow?.client_id))) {
+      const clientId = Number(elderlyRow.client_id);
+      const { data: clientRow, error: clientRowError } = await supabase
+        .from('users')
+        .select('id, full_name, phone')
+        .eq('id', clientId)
+        .single();
+      throwIfError(clientRowError, 'Unable to load client details for replacement notification');
+
+      const oldBuddyName = String(currentBuddyRow?.full_name || `Caretaker #${assignmentRow.buddy_id}`).trim();
+      const newBuddyName = String(buddyRow?.full_name || `Caretaker #${newBuddyId}`).trim();
+      const elderlyName = String(elderlyRow?.full_name || 'your family member').trim();
+      const notificationMessage = `Update: caretaker for ${elderlyName} changed from ${oldBuddyName} to ${newBuddyName}.${reason ? ` Reason: ${reason}.` : ''}`;
+
+      const requestPayload = {
+        user_id: clientId,
+        elderly_id: Number(assignmentRow.elderly_id),
+        request_type: 'assignment_update',
+        message: notificationMessage,
+        status: 'new',
+      };
+
+      let { error: createRequestError } = await supabase.from('client_requests').insert(requestPayload);
+      if (createRequestError && String(createRequestError.message || '').includes('client_requests_status_check')) {
+        ({ error: createRequestError } = await supabase.from('client_requests').insert({
+          ...requestPayload,
+          status: 'open',
+        }));
+      }
+      throwIfError(createRequestError, 'Unable to notify client about caretaker replacement');
+
+      await createNotificationActionLogEntry({
+        clientId,
+        actorUserId: req.session.user?.id || null,
+        recipientRole: 'client',
+        recipientName: String(clientRow?.full_name || 'Client').trim(),
+        recipientPhone: normalizePhone(clientRow?.phone || ''),
+        channel: 'notify',
+        templateKey: 'general_update',
+        messagePreview: notificationMessage,
+      });
+      clientNotified = true;
+    }
+
+    const actionText = servicePlanType === 'long_term'
+      ? (clientNotified ? 'Replacement caretaker assigned and client notified.' : 'Replacement caretaker assigned.')
+      : 'Caretaker switched.';
+    return res.json({ message: actionText });
+  } catch (error) {
+    console.error('Switch caretaker failed:', error);
+    if (Number.isFinite(Number(error?.statusCode)) && Number(error.statusCode) >= 400 && Number(error.statusCode) < 500) {
+      return res.status(Number(error.statusCode)).json({ message: error.message || 'Unable to switch caretaker.' });
+    }
+    return res.status(500).json({ message: error.message || 'Unable to switch caretaker.' });
+  }
+});
+
+app.delete('/api/assignments/:id', async (req, res) => {
+  if (!ensureAdminSession(req, res)) {
+    return;
+  }
+
+  const assignmentId = Number(req.params.id);
+  if (!Number.isFinite(assignmentId) || assignmentId <= 0) {
+    return res.status(400).json({ message: 'Valid assignment id is required.' });
+  }
+
+  try {
+    const { data: assignmentRow, error: assignmentError } = await supabase
+      .from('assignments')
+      .select('id, buddy_id, elderly_id')
+      .eq('id', assignmentId)
+      .single();
+    throwIfError(assignmentError, 'Unable to load assignment for deletion');
+
+    if (!assignmentRow) {
+      return res.status(404).json({ message: 'Assignment not found.' });
+    }
+
+    const { data: visitRows, error: visitRowsError } = await supabase
+      .from('visits')
+      .select('id')
+      .eq('assignment_id', assignmentId);
+    throwIfError(visitRowsError, 'Unable to load visits for assignment deletion');
+
+    const visitIds = (visitRows || []).map((entry) => entry.id);
+    if (visitIds.length > 0) {
+      const { error: deleteVisitsError } = await supabase
+        .from('visits')
+        .delete()
+        .in('id', visitIds);
+      throwIfError(deleteVisitsError, 'Unable to delete assignment visits');
+    }
+
+    const { error: deleteAssignmentError } = await supabase
+      .from('assignments')
+      .delete()
+      .eq('id', assignmentId);
+    throwIfError(deleteAssignmentError, 'Unable to delete assignment');
+
+    return res.json({ message: 'Assignment deleted.' });
+  } catch (error) {
+    console.error('Delete assignment failed:', error);
+    return res.status(500).json({ message: error.message || 'Unable to delete assignment.' });
+  }
+});
+
+app.post('/api/assignments/:id/short-term-slots', async (req, res) => {
+  if (!ensureAdminSession(req, res)) {
+    return;
+  }
+
+  const assignmentId = Number(req.params.id);
+  const { short_term_slots } = req.body;
+
+  if (!Number.isFinite(assignmentId) || assignmentId <= 0) {
+    return res.status(400).json({ message: 'Valid assignment id is required.' });
+  }
+
+  try {
+    const { data: assignmentRow, error: assignmentRowError } = await supabase
+      .from('assignments')
+      .select('id, buddy_id, elderly_id, status, approval_state, service_plan_type, term_type, monthly_visit_plan, planned_visit_duration_minutes')
+      .eq('id', assignmentId)
+      .single();
+    throwIfError(assignmentRowError, 'Unable to load assignment for short-term slots update');
+
+    const servicePlanType = normalizeServicePlanType(assignmentRow.service_plan_type, assignmentRow.term_type);
+    if (servicePlanType !== 'short_term') {
+      return res.status(400).json({ message: 'Short-term slots can only be updated for short-term assignments.' });
+    }
+
+    const expectedCount = normalizeIntegerValue(assignmentRow.monthly_visit_plan);
+    const durationMinutes = normalizeIntegerValue(assignmentRow.planned_visit_duration_minutes);
+    if (!MONTHLY_VISIT_PLAN_VALUES.has(expectedCount) || !PLANNED_VISIT_DURATION_VALUES.has(durationMinutes)) {
+      return res.status(400).json({ message: 'Assignment is missing valid short-term plan configuration.' });
+    }
+
+    const normalizedShortTermSlots = normalizeShortTermSlots(short_term_slots, expectedCount, durationMinutes);
+    await assertRestGapForShortTermSlots(Number(assignmentRow.buddy_id), normalizedShortTermSlots, assignmentId);
+
+    const { error: deleteSlotsError } = await supabase
+      .from('short_term_visit_slots')
+      .delete()
+      .eq('assignment_id', assignmentId);
+    throwIfError(deleteSlotsError, 'Unable to replace short-term slots');
+
+    const { error: insertSlotsError } = await supabase
+      .from('short_term_visit_slots')
+      .insert(
+        normalizedShortTermSlots.map((slot) => ({
+          assignment_id: assignmentId,
+          buddy_id: Number(assignmentRow.buddy_id),
+          elderly_id: Number(assignmentRow.elderly_id),
+          visit_date: slot.visit_date,
+          start_time: slot.start_time,
+          end_time: slot.end_time,
+          start_at: slot.start_at,
+          end_at: slot.end_at,
+        })),
+      );
+    throwIfError(insertSlotsError, 'Unable to save short-term slots');
+
+    await syncScheduledVisitsForShortTermAssignment({
+      assignmentId,
+      buddyId: Number(assignmentRow.buddy_id),
+      elderlyId: Number(assignmentRow.elderly_id),
+      plannedVisitDurationMinutes: durationMinutes,
+      normalizedShortTermSlots,
+    });
+
+    const approvalState = normalizeApprovalState(assignmentRow.approval_state || 'pending_approval');
+    await recordAssignmentLifecycleAudit({
+      assignment_id: assignmentId,
+      from_status: approvalState,
+      to_status: approvalState,
+      actor_user_id: req.session.user?.id || null,
+      notes: `Updated short-term visit slots (${normalizedShortTermSlots.length} planned visits).`,
+    }, 'Update short-term slots');
+
+    return res.json({ message: 'Short-term visit slots updated.', slots_count: normalizedShortTermSlots.length });
+  } catch (error) {
+    console.error('Update short-term slots failed:', error);
+    if (Number.isFinite(Number(error?.statusCode)) && Number(error.statusCode) >= 400 && Number(error.statusCode) < 500) {
+      return res.status(Number(error.statusCode)).json({ message: error.message || 'Unable to update short-term slots.' });
+    }
+    return res.status(500).json({ message: error.message || 'Unable to update short-term slots.' });
   }
 });
 
@@ -2806,14 +3488,13 @@ app.post('/api/assignments/:id/extend', async (req, res) => {
 
     const approvalState = normalizeApprovalState(existingAssignment.approval_state || 'pending_approval');
     const note = `Assignment extended until ${extensionDate}${reason ? ` (${String(reason).trim()})` : ''}`;
-    const { error: lifecycleAuditError } = await supabase.from('assignment_lifecycle_audits').insert({
+    await recordAssignmentLifecycleAudit({
       assignment_id: assignmentId,
       from_status: approvalState,
       to_status: approvalState,
       actor_user_id: req.session.user?.id || null,
       notes: note,
-    });
-    throwIfError(lifecycleAuditError, 'Unable to record assignment extension audit');
+    }, 'Extend assignment');
 
     return res.json({ message: `Assignment extended to ${extensionDate}.`, end_date: extensionDate });
   } catch (error) {

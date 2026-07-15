@@ -443,6 +443,16 @@ button {
   justify-content: flex-end;
 }
 
+.status-popup-panel {
+  width: min(520px, 100%);
+}
+
+.status-popup-message {
+  margin-bottom: 14px;
+  color: var(--text);
+  font-size: 1rem;
+}
+
 .archive-month-input {
   min-width: 160px;
   max-width: 180px;
@@ -569,6 +579,32 @@ button {
 .calendar-chip-pending {
   background: #fff7d6;
   color: #92400e;
+}
+
+.calendar-card-grid {
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+}
+
+.calendar-day-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.calendar-day-card-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.calendar-day-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.calendar-day-card-actions {
+  margin-top: 4px;
 }
 
 .overlay-title {
@@ -1042,6 +1078,14 @@ button {
   .auth-header {
     flex-direction: column;
   }
+
+  .assignment-slot-row {
+    grid-template-columns: 1fr;
+  }
+
+  .assignment-history-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .auth-home-actions {
@@ -1059,6 +1103,141 @@ button {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 16px;
   margin-top: 14px;
+}
+
+.assignment-card-grid {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.assignment-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.assignment-card-next-day {
+  border-color: #f59e0b;
+  box-shadow: 0 10px 24px rgba(245, 158, 11, 0.16);
+  background: linear-gradient(180deg, #fffaf0 0%, var(--surface) 100%);
+}
+
+.assignment-card-active {
+  border-color: #10b981;
+  box-shadow: 0 10px 24px rgba(16, 185, 129, 0.18);
+  background: linear-gradient(180deg, #f2fcf7 0%, var(--surface) 100%);
+}
+
+.assignment-card-closed-long-term {
+  border-color: #0ea5e9;
+  box-shadow: 0 10px 24px rgba(14, 165, 233, 0.16);
+  background: linear-gradient(180deg, #f0f9ff 0%, var(--surface) 100%);
+}
+
+.assignment-card-closed-short-term {
+  border-color: #94a3b8;
+  box-shadow: 0 10px 24px rgba(148, 163, 184, 0.16);
+  background: linear-gradient(180deg, #f8fafc 0%, var(--surface) 100%);
+}
+
+.assignment-card-tag {
+  align-self: flex-start;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  background: #e2e8f0;
+  color: #1e293b;
+}
+
+.assignment-card-tag-next-day {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.assignment-card-tag-active {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.assignment-card-tag-closed-long {
+  background: #dbeafe;
+  color: #1e3a8a;
+}
+
+.assignment-card-tag-closed-short {
+  background: #e2e8f0;
+  color: #334155;
+}
+
+.assignment-card-actions {
+  margin-top: 6px;
+}
+
+.assignment-overlay {
+  width: min(980px, 100%);
+}
+
+.assignment-slot-editor {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.assignment-slot-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.assignment-slot-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.assignment-slot-row .btn {
+  white-space: nowrap;
+}
+
+.assignment-history-section {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.assignment-history-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 8px;
+}
+
+.assignment-history-scroll {
+  margin-top: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px;
+  background: #fbfdff;
+}
+
+.family-audit-item {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.family-audit-item + .family-audit-item {
+  margin-top: 8px;
+}
+
+.note {
+  color: var(--muted);
+  margin-top: 4px;
 }
 
 .panel-table {
@@ -1280,6 +1459,10 @@ textarea.small-input {
   }
 
   .calendar-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .calendar-card-grid {
     grid-template-columns: 1fr;
   }
 

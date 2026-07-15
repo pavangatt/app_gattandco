@@ -38,6 +38,7 @@ truncate table
   public.visit_sessions,
   public.visit_tasks,
   public.visits,
+  public.short_term_visit_slots,
   public.assignment_lifecycle_audits,
   public.care_plan_services,
   public.assignments,
