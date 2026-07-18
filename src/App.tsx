@@ -428,12 +428,83 @@ type ShortTermSlotDraft = {
   start_time: string;
 };
 
+type ClientCoordinateDraft = {
+  lat: string;
+  lng: string;
+};
+
+type AssignmentVisitAssignDraft = {
+  scheduled_date: string;
+  start_time: string;
+};
+
 const createShortTermSlotDrafts = (count: number): ShortTermSlotDraft[] => (
   Array.from({ length: Math.max(0, count) }, () => ({
     visit_date: '',
     start_time: '',
   }))
 );
+
+const CLIENT_COORDS_TAG_REGEX = /\[CLIENT_COORDS:([-+]?\d+(?:\.\d+)?),([-+]?\d+(?:\.\d+)?)\]/;
+
+const parseClientCoordsFromAdminNotes = (notes: string | null | undefined): { lat: number; lng: number } | null => {
+  const text = String(notes || '');
+  const match = text.match(CLIENT_COORDS_TAG_REGEX);
+  if (!match) {
+    return null;
+  }
+
+  const lat = Number(match[1]);
+  const lng = Number(match[2]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+  return { lat, lng };
+};
+
+const stripClientCoordsTag = (notes: string | null | undefined): string => {
+  return String(notes || '').replace(CLIENT_COORDS_TAG_REGEX, '').trim();
+};
+
+const upsertClientCoordsTag = (notes: string | null | undefined, latRaw: string, lngRaw: string): string => {
+  const cleanedNotes = stripClientCoordsTag(notes);
+  const lat = Number(latRaw);
+  const lng = Number(lngRaw);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return cleanedNotes;
+  }
+
+  const normalizedLat = lat.toFixed(6);
+  const normalizedLng = lng.toFixed(6);
+  const tag = `[CLIENT_COORDS:${normalizedLat},${normalizedLng}]`;
+
+  return cleanedNotes ? `${cleanedNotes} ${tag}` : tag;
+};
+
+const parseLatLngFromText = (value: string | null | undefined): { lat: number; lng: number } | null => {
+  if (!value) {
+    return null;
+  }
+  const [latRaw, lngRaw] = String(value).split(',').map((part) => part.trim());
+  const lat = Number(latRaw);
+  const lng = Number(lngRaw);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+  return { lat, lng };
+};
+
+const haversineKm = (from: { lat: number; lng: number }, to: { lat: number; lng: number }): number => {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const earthRadiusKm = 6371;
+  const dLat = toRad(to.lat - from.lat);
+  const dLng = toRad(to.lng - from.lng);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(toRad(from.lat)) * Math.cos(toRad(to.lat)) * Math.sin(dLng / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+};
 
 const initialAuthState = {
   identifier: '',
@@ -630,6 +701,10 @@ function App() {
   const [adminTab, setAdminTab] = useState<AdminTab>('overview');
   const [clientTab, setClientTab] = useState<ClientTab>('visits');
   const [buddyTab, setBuddyTab] = useState<BuddyTab>('location');
+  const [visitReassignmentModal, setVisitReassignmentModal] = useState<{ visit: Visit; selectedBuddyId: string } | null>(null);
+  const [backfillConflictModal, setBackfillConflictModal] = useState<{ conflict_date: string; elderly_id: number; current_buddy_id: number; backfill_reason: string; selectedReassignBuddyId: string } | null>(null);
+  const [assignmentVisitAssignDraftsByVisit, setAssignmentVisitAssignDraftsByVisit] = useState<Record<number, AssignmentVisitAssignDraft>>({});
+  const [assignmentClientCoordinateByAssignment, setAssignmentClientCoordinateByAssignment] = useState<Record<number, ClientCoordinateDraft>>({});
 
   const normalizeUser = (apiUser: ApiUser): User => ({
     id: apiUser.id,
@@ -782,13 +857,20 @@ function App() {
   }, [user, adminTab]);
 
   useEffect(() => {
-    if (!user || user.role !== 'admin' || adminTab !== 'visits') {
+    if (!user) {
+      return;
+    }
+
+    const shouldLoadForAdmin = user.role === 'admin' && adminTab === 'visits';
+    const shouldLoadForBuddy = user.role === 'buddy' && buddyTab === 'visits';
+
+    if (!shouldLoadForAdmin && !shouldLoadForBuddy) {
       return;
     }
 
     void loadVisitSessionHistory();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user, adminTab]);
+  }, [user, adminTab, buddyTab]);
 
   useEffect(() => {
     if (!user || user.role !== 'admin' || adminTab !== 'calendar-reporting') {
@@ -878,12 +960,18 @@ function App() {
     const nextReplacementBuddyDrafts: Record<number, string> = {};
     const nextReplacementReasonDrafts: Record<number, string> = {};
     const nextSlotDraftsByAssignment: Record<number, ShortTermSlotDraft[]> = {};
+    const nextClientCoordsByAssignment: Record<number, ClientCoordinateDraft> = {};
     assignments.forEach((assignment) => {
+      const parsedCoords = parseClientCoordsFromAdminNotes(assignment.admin_notes);
       nextAssignmentEdits[assignment.id] = {
         status: assignment.status || 'active',
         service_plan_type: assignment.service_plan_type || (assignment.term_type === 'long' ? 'long_term' : 'short_term'),
         approval_state: assignment.approval_state || 'pending_approval',
-        admin_notes: assignment.admin_notes || '',
+        admin_notes: stripClientCoordsTag(assignment.admin_notes),
+      };
+      nextClientCoordsByAssignment[assignment.id] = {
+        lat: parsedCoords ? String(parsedCoords.lat) : '',
+        lng: parsedCoords ? String(parsedCoords.lng) : '',
       };
       nextReplacementBuddyDrafts[assignment.id] = String(assignment.buddy_id || '');
       nextReplacementReasonDrafts[assignment.id] = '';
@@ -899,6 +987,7 @@ function App() {
     setAssignmentReplacementBuddyByAssignment(nextReplacementBuddyDrafts);
     setAssignmentReplacementReasonByAssignment(nextReplacementReasonDrafts);
     setAssignmentSlotDraftsByAssignment(nextSlotDraftsByAssignment);
+    setAssignmentClientCoordinateByAssignment(nextClientCoordsByAssignment);
 
     if (assignmentDetailsId !== null && !assignments.some((entry) => entry.id === assignmentDetailsId)) {
       setAssignmentDetailsId(null);
@@ -1107,13 +1196,16 @@ function App() {
   const getActiveCaseVisits = (visitList: Visit[]) => {
     const today = new Date().toISOString().slice(0, 10);
     return visitList.filter((visit) => {
+      if (visit.scheduled_date !== today) {
+        return false;
+      }
       const status = visit.visit_status || 'scheduled';
       const assignment = assignments.find((entry) => entry.id === visit.assignment_id);
       const assignmentActive = !assignment || (
         (assignment.approval_state || 'pending_approval') === 'approved'
         && assignment.status === 'active'
       );
-      return assignmentActive && visit.scheduled_date === today && (status === 'scheduled' || status === 'in_progress');
+      return assignmentActive && status === 'in_progress';
     });
   };
 
@@ -1193,6 +1285,29 @@ function App() {
     return { label: 'Past', className: 'pill badge-inactive' };
   };
 
+  const getDistanceSummaryForVisit = (visit: Visit, liveLocation: LocationSnapshot | null) => {
+    const assignment = safeAssignments.find((entry) => Number(entry.id) === Number(visit.assignment_id));
+    const clientCoords = parseClientCoordsFromAdminNotes(assignment?.admin_notes || null);
+    const caregiverCoords = liveLocation
+      ? { lat: Number(liveLocation.lat), lng: Number(liveLocation.lng) }
+      : parseLatLngFromText(visit.arrival_lat_lng || null);
+
+    if (!clientCoords) {
+      return { label: 'Set client coordinates in assignment details to enable distance check.', near: null as boolean | null };
+    }
+
+    if (!caregiverCoords || !Number.isFinite(caregiverCoords.lat) || !Number.isFinite(caregiverCoords.lng)) {
+      return { label: 'Waiting for caregiver live location.', near: null as boolean | null };
+    }
+
+    const distanceKm = haversineKm(caregiverCoords, clientCoords);
+    const near = distanceKm <= 0.5;
+    return {
+      label: `Distance to client: ${distanceKm.toFixed(2)} km (${near ? 'Near' : 'Far'})`,
+      near,
+    };
+  };
+
   const handleAssignmentEditChange = (assignmentId: number, field: keyof AssignmentEditDraft, value: string) => {
     setAssignmentEdits((current) => ({
       ...current,
@@ -1207,16 +1322,21 @@ function App() {
   };
 
   const handleVisitEditChange = (visitId: number, field: 'visit_status' | 'status_check' | 'buddy_notes' | 'client_visible_notes', value: string) => {
-    setVisitEdits((current) => ({
-      ...current,
-      [visitId]: {
-        visit_status: current[visitId]?.visit_status || 'scheduled',
-        status_check: current[visitId]?.status_check || '',
-        buddy_notes: current[visitId]?.buddy_notes || '',
-        client_visible_notes: current[visitId]?.client_visible_notes || '',
-        [field]: value,
-      },
-    }));
+    setVisitEdits((current) => {
+      const existingDraft = current[visitId];
+      const visitData = visits.find((v) => v.id === visitId);
+      
+      return {
+        ...current,
+        [visitId]: {
+          visit_status: existingDraft?.visit_status ?? visitData?.visit_status ?? 'scheduled',
+          status_check: existingDraft?.status_check ?? visitData?.status_check ?? '',
+          buddy_notes: existingDraft?.buddy_notes ?? visitData?.buddy_notes ?? '',
+          client_visible_notes: existingDraft?.client_visible_notes ?? visitData?.client_visible_notes ?? '',
+          [field]: value,
+        },
+      };
+    });
   };
 
   const loadBuddyLocations = async (visitList: Visit[]) => {
@@ -1271,13 +1391,13 @@ function App() {
     setAssignmentLocations(locationMap);
   };
 
-  const loadDashboard = async () => {
+  const loadDashboard = async (forceRefresh = false) => {
     if (!user) {
       return [] as Visit[];
     }
 
     const cacheKey = getDashboardCacheKey(user);
-    const cachedRaw = sessionStorage.getItem(cacheKey);
+    const cachedRaw = forceRefresh ? null : sessionStorage.getItem(cacheKey);
     if (cachedRaw) {
       try {
         const cached = JSON.parse(cachedRaw) as {
@@ -1530,13 +1650,13 @@ function App() {
   };
 
   const loadVisitSessionHistory = async () => {
-    if (!user || user.role !== 'admin') {
+    if (!user || !['admin', 'buddy'].includes(user.role)) {
       return;
     }
 
     setVisitSessionHistoryLoading(true);
     try {
-      const response = await fetch('/api/visit-sessions?all=true');
+      const response = await fetch(user.role === 'admin' ? '/api/visit-sessions?all=true' : '/api/visit-sessions');
       const result = await response.json();
       if (!response.ok) {
         setStatusMessage(result.message || 'Unable to load visit session history.');
@@ -1641,7 +1761,7 @@ function App() {
       const generated = Number(result?.stats?.visit_reminder_d1_generated || 0);
       const skipped = Number(result?.stats?.visit_reminder_d1_skipped_duplicates || 0);
       setStatusMessage(`${result.message || 'Reminder runner completed.'} Generated ${generated} reminder log(s), skipped ${skipped} duplicate(s).`);
-      await loadDashboard();
+      await loadDashboard(true);
     } catch {
       setStatusMessage('Unable to connect to the server.');
     } finally {
@@ -1723,7 +1843,7 @@ function App() {
       }
 
       setStatusMessage(result.message || 'Assignment extended.');
-      await loadDashboard();
+      await loadDashboard(true);
     } catch {
       setStatusMessage('Unable to connect to the server.');
     }
@@ -1801,7 +1921,7 @@ function App() {
         ...current,
         [assignmentId]: { intime: '', outtime: '', entry_notes: '', exit_notes: '' },
       }));
-      await loadDashboard();
+      await loadDashboard(true);
     } catch {
       setStatusMessage('Unable to connect to the server.');
     }
@@ -1810,7 +1930,44 @@ function App() {
   const getTodaySessionForAssignment = (assignmentId: number) => {
     const today = new Date().toISOString().slice(0, 10);
     const rows = dailyRecordsByAssignment[assignmentId] || [];
-    return rows.find((entry) => entry.session_date === today) || null;
+    const dailyRecordMatch = rows.find((entry) => entry.session_date === today) || null;
+    if (dailyRecordMatch) {
+      return dailyRecordMatch;
+    }
+
+    return visitSessionHistory.find((entry) => Number(entry.assignment_id) === Number(assignmentId) && entry.session_date === today) || null;
+  };
+
+  const getOpenSessionForVisit = (visit: Visit) => {
+    if (!visit.assignment_id) {
+      return null;
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    if (visit.scheduled_date !== today) {
+      return null;
+    }
+
+    return visitSessionHistory.find((entry) => (
+      Number(entry.assignment_id) === Number(visit.assignment_id)
+      && (Number(entry.visit_id || 0) === Number(visit.id) || entry.session_date === today)
+      && Boolean(entry.intime)
+      && !entry.outtime
+    )) || null;
+  };
+
+  const isVisitSessionStarted = (visit: Visit) => {
+    if (visit.scheduled_date !== new Date().toISOString().slice(0, 10)) {
+      return false;
+    }
+
+    const visitState = String(visitEdits[visit.id]?.visit_status || visit.visit_status || 'scheduled').toLowerCase();
+    return visitState === 'in_progress' || Boolean(getOpenSessionForVisit(visit));
+  };
+
+  const isVisitSessionClosed = (visit: Visit) => {
+    const visitState = String(visitEdits[visit.id]?.visit_status || visit.visit_status || 'scheduled').toLowerCase();
+    return ['completed', 'cancelled', 'missed', 'rescheduled'].includes(visitState);
   };
 
   const handleStartVisitSession = async (visit: Visit) => {
@@ -1837,7 +1994,13 @@ function App() {
       }
 
       setStatusMessage(result.message || 'Visit session started.');
-      await loadDashboard();
+      await loadDashboard(true);
+      setVisitEdits((current) => {
+        const next = { ...current };
+        delete next[visit.id];
+        return next;
+      });
+      await loadVisitSessionHistory();
     } catch {
       setStatusMessage('Unable to connect to the server.');
     }
@@ -1849,7 +2012,7 @@ function App() {
       return;
     }
 
-    const sessionRow = getTodaySessionForAssignment(visit.assignment_id);
+    const sessionRow = getOpenSessionForVisit(visit) || getTodaySessionForAssignment(visit.assignment_id);
     if (!sessionRow) {
       setStatusMessage('Start the visit session before completing it.');
       return;
@@ -1870,6 +2033,7 @@ function App() {
 
       setStatusMessage(result.message || 'Visit session completed.');
       await loadDashboard();
+      await loadVisitSessionHistory();
     } catch {
       setStatusMessage('Unable to connect to the server.');
     }
@@ -1881,7 +2045,7 @@ function App() {
       return;
     }
 
-    const sessionRow = getTodaySessionForAssignment(visit.assignment_id);
+    const sessionRow = getOpenSessionForVisit(visit) || getTodaySessionForAssignment(visit.assignment_id);
     if (!sessionRow) {
       setStatusMessage('Start the visit session before backfilling it.');
       return;
@@ -1913,8 +2077,22 @@ function App() {
         return;
       }
 
+      // Check if there's a conflict that needs reassignment
+      if (result.conflict) {
+        setBackfillConflictModal({
+          conflict_date: result.conflict_date,
+          elderly_id: result.elderly_id,
+          current_buddy_id: result.current_buddy_id,
+          backfill_reason: result.backfill_reason,
+          selectedReassignBuddyId: '',
+        });
+        setStatusMessage('Caregiver is busy on ' + result.conflict_date + '. Choose to reassign to another caregiver or auto-carry-forward.');
+        return;
+      }
+
       setStatusMessage(result.message || 'Visit session backfilled.');
       await loadDashboard();
+      await loadVisitSessionHistory();
     } catch {
       setStatusMessage('Unable to connect to the server.');
     }
@@ -1977,8 +2155,9 @@ function App() {
       return;
     }
 
-    if (getActiveCaseVisits(visitList).length === 0) {
-      setStatusMessage('Location updates are available only during an active case slot.');
+    const activeVisits = getActiveCaseVisits(visitList);
+    if (activeVisits.length === 0) {
+      setStatusMessage('Location updates are available only after a visit session starts.');
       return;
     }
 
@@ -1995,7 +2174,7 @@ function App() {
           const response = await fetch('/api/location', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ buddy_id: user.id, lat, lng }),
+            body: JSON.stringify({ buddy_id: user.id, assignment_id: activeVisits[0].assignment_id, lat, lng }),
           });
           const result = await response.json();
           setLocation(result.currentLocation || null);
@@ -2250,12 +2429,31 @@ function App() {
       return;
     }
 
+    const coordDraft = assignmentClientCoordinateByAssignment[assignmentId] || { lat: '', lng: '' };
+    const hasAnyCoord = String(coordDraft.lat || '').trim() || String(coordDraft.lng || '').trim();
+    if (hasAnyCoord) {
+      const lat = Number(coordDraft.lat);
+      const lng = Number(coordDraft.lng);
+      const latValid = Number.isFinite(lat) && lat >= -90 && lat <= 90;
+      const lngValid = Number.isFinite(lng) && lng >= -180 && lng <= 180;
+      if (!latValid || !lngValid) {
+        setStatusMessage('Client coordinates are invalid. Latitude must be between -90 and 90, longitude between -180 and 180.');
+        return;
+      }
+    }
+
+    const mergedAdminNotes = upsertClientCoordsTag(draft.admin_notes, coordDraft.lat, coordDraft.lng);
+    const payload = {
+      ...draft,
+      admin_notes: mergedAdminNotes,
+    };
+
     setStatusMessage('');
     try {
       const response = await fetch(`/api/assignments/${assignmentId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(draft),
+        body: JSON.stringify(payload),
       });
       const result = await response.json();
       if (!response.ok) {
@@ -2289,6 +2487,12 @@ function App() {
   };
 
   const handleAssignmentApprovalAction = async (assignmentId: number) => {
+    const assignment = safeAssignments.find((entry) => Number(entry.id) === Number(assignmentId));
+    if ((assignment?.approval_state || 'pending_approval') === 'approved') {
+      setStatusMessage('This assignment is already approved.');
+      return;
+    }
+
     const notes = assignmentEdits[assignmentId]?.admin_notes || '';
     setStatusMessage('');
     try {
@@ -2384,6 +2588,131 @@ function App() {
       }
 
       setStatusMessage(result.message || 'Caretaker switched.');
+      await loadDashboard();
+    } catch {
+      setStatusMessage('Unable to connect to the server.');
+    }
+  };
+
+  const handleReassignVisitBuddy = async (visit: Visit) => {
+    setVisitReassignmentModal({ visit, selectedBuddyId: '' });
+  };
+
+  const handleConfirmVisitReassignment = async () => {
+    if (!visitReassignmentModal) return;
+
+    const { visit, selectedBuddyId } = visitReassignmentModal;
+    const newBuddyId = Number(selectedBuddyId);
+
+    if (!newBuddyId) {
+      setStatusMessage('Select a caretaker for this visit.');
+      return;
+    }
+
+    setStatusMessage('');
+    try {
+      const response = await fetch('/api/visits/reassign-buddy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          visit_id: visit.id,
+          new_buddy_id: newBuddyId,
+          elderly_id: visit.elderly_id,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        setStatusMessage(result.message || 'Unable to reassign visit.');
+        return;
+      }
+
+      setStatusMessage(result.message || 'Visit reassigned to new caretaker.');
+      setVisitReassignmentModal(null);
+      await loadDashboard();
+    } catch {
+      setStatusMessage('Unable to connect to the server.');
+    }
+  };
+
+  const handleConfirmBackfillReassignment = async () => {
+    if (!backfillConflictModal) return;
+
+    const { conflict_date, elderly_id, backfill_reason, selectedReassignBuddyId } = backfillConflictModal;
+    const newBuddyId = Number(selectedReassignBuddyId);
+
+    if (!newBuddyId) {
+      setStatusMessage('Select a caretaker for the rescheduled visit.');
+      return;
+    }
+
+    setStatusMessage('');
+    try {
+      const response = await fetch('/api/backfill-reassign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          conflict_date,
+          new_buddy_id: newBuddyId,
+          elderly_id,
+          backfill_reason,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        setStatusMessage(result.message || 'Unable to reassign backfilled visit.');
+        return;
+      }
+
+      setStatusMessage(result.message || 'Visit rescheduled to new caretaker.');
+      setBackfillConflictModal(null);
+      await loadDashboard();
+      await loadVisitSessionHistory();
+    } catch {
+      setStatusMessage('Unable to connect to the server.');
+    }
+  };
+
+  const handleAutoCarryForward = async () => {
+    if (!backfillConflictModal) return;
+
+    setStatusMessage('Auto-carrying forward to next available day...');
+    setBackfillConflictModal(null);
+    // The backend already handled auto-carry-forward by not returning conflict
+    // This is just for UX - user confirms they want the system default behavior
+    await loadDashboard();
+    await loadVisitSessionHistory();
+  };
+
+  const handleAssignVisitToSameBuddy = async (assignment: Assignment, visit: Visit) => {
+    const draft = assignmentVisitAssignDraftsByVisit[visit.id] || {
+      scheduled_date: visit.scheduled_date,
+      start_time: '09:00',
+    };
+
+    if (!draft.scheduled_date) {
+      setStatusMessage('Select a date to assign this follow-up visit.');
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/visits/assign-same-buddy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          assignment_id: assignment.id,
+          buddy_id: assignment.buddy_id,
+          elderly_id: assignment.elderly_id,
+          scheduled_date: draft.scheduled_date,
+          start_time: draft.start_time,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        setStatusMessage(result.message || 'Unable to assign follow-up visit.');
+        return;
+      }
+
+      setStatusMessage(result.message || 'Follow-up visit assigned.');
       await loadDashboard();
     } catch {
       setStatusMessage('Unable to connect to the server.');
@@ -2505,7 +2834,15 @@ function App() {
         return;
       }
       setStatusMessage(result.message);
-      await loadDashboard();
+      
+      // Clear the draft immediately and force refresh from server
+      setVisitEdits((current) => {
+        const next = { ...current };
+        delete next[visitId];
+        return next;
+      });
+      await loadDashboard(true);
+      await loadVisitSessionHistory();
     } catch (error) {
       setStatusMessage('Unable to connect to the server.');
     }
@@ -4191,8 +4528,7 @@ function App() {
     const servicePlanType = assignmentEdits[assignment.id]?.service_plan_type || assignment.service_plan_type || 'short_term';
     const assignmentVisits = visits
       .filter((entry) => Number(entry.assignment_id) === Number(assignment.id))
-      .sort((left, right) => String(left.scheduled_date || '').localeCompare(String(right.scheduled_date || '')))
-      .slice(0, 8);
+      .sort((left, right) => String(left.scheduled_date || '').localeCompare(String(right.scheduled_date || '')));
     const assignmentApprovalHistory = [...(assignmentAuditsByAssignment[assignment.id] || [])]
       .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
       .slice(0, 30);
@@ -4265,48 +4601,143 @@ function App() {
                 placeholder={assignment.address || 'Add note'}
               />
             </label>
+            <label>
+              Client latitude
+              <input
+                className="small-input"
+                type="number"
+                step="0.000001"
+                value={assignmentClientCoordinateByAssignment[assignment.id]?.lat || ''}
+                onChange={(event) => setAssignmentClientCoordinateByAssignment((current) => ({
+                  ...current,
+                  [assignment.id]: {
+                    lat: event.target.value,
+                    lng: current[assignment.id]?.lng || '',
+                  },
+                }))}
+                placeholder="e.g. 12.905620"
+              />
+            </label>
+            <label>
+              Client longitude
+              <input
+                className="small-input"
+                type="number"
+                step="0.000001"
+                value={assignmentClientCoordinateByAssignment[assignment.id]?.lng || ''}
+                onChange={(event) => setAssignmentClientCoordinateByAssignment((current) => ({
+                  ...current,
+                  [assignment.id]: {
+                    lat: current[assignment.id]?.lat || '',
+                    lng: event.target.value,
+                  },
+                }))}
+                placeholder="e.g. 77.599040"
+              />
+            </label>
           </div>
 
           {!isLongTermAssignment(assignment) ? (
-            <div className="assignment-slot-editor">
-              <div className="family-title">Short-term visit slots</div>
-              <div className="directory-meta">Package count: {assignment.monthly_visit_plan || 0} visits/month.</div>
-              <div className="assignment-slot-list">
-                {slotDraftRows.map((slot, slotIndex) => (
-                  <div className="assignment-slot-row" key={`assignment-slot-${assignment.id}-${slotIndex}`}>
-                    <label>
-                      Visit date
-                      <input
-                        className="small-input"
-                        type="date"
-                        value={slot.visit_date}
-                        onChange={(event) => handleAssignmentSlotDraftChange(assignment.id, slotIndex, 'visit_date', event.target.value)}
-                      />
-                    </label>
-                    <label>
-                      Start time
-                      <input
-                        className="small-input"
-                        type="time"
-                        value={slot.start_time}
-                        onChange={(event) => handleAssignmentSlotDraftChange(assignment.id, slotIndex, 'start_time', event.target.value)}
-                      />
-                    </label>
-                    <button type="button" className="btn btn-secondary" onClick={() => handleRemoveAssignmentSlotDraft(assignment, slotIndex)}>
-                      Remove
-                    </button>
+            <>
+              <div className="assignment-slot-editor">
+                <div className="family-title">Short-term visit slots</div>
+                <div className="directory-meta">Package count: {assignment.monthly_visit_plan || 0} visits/month.</div>
+                <div className="assignment-slot-list">
+                  {slotDraftRows.map((slot, slotIndex) => (
+                    <div className="assignment-slot-row" key={`assignment-slot-${assignment.id}-${slotIndex}`}>
+                      <label>
+                        Visit date
+                        <input
+                          className="small-input"
+                          type="date"
+                          value={slot.visit_date}
+                          onChange={(event) => handleAssignmentSlotDraftChange(assignment.id, slotIndex, 'visit_date', event.target.value)}
+                        />
+                      </label>
+                      <label>
+                        Start time
+                        <input
+                          className="small-input"
+                          type="time"
+                          value={slot.start_time}
+                          onChange={(event) => handleAssignmentSlotDraftChange(assignment.id, slotIndex, 'start_time', event.target.value)}
+                        />
+                      </label>
+                      <button type="button" className="btn btn-secondary" onClick={() => handleRemoveAssignmentSlotDraft(assignment, slotIndex)}>
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div className="directory-actions">
+                  <button type="button" className="btn btn-secondary" onClick={() => handleAddAssignmentSlotDraft(assignment)}>
+                    Add extra visit row
+                  </button>
+                  <button type="button" className="btn btn-primary" onClick={() => void handleSaveAssignmentSlots(assignment)}>
+                    Save slot changes
+                  </button>
+                </div>
+              </div>
+              <div className="family-audit-list">
+                <div className="family-title">All scheduled visits (including backfilled)</div>
+                {assignmentVisits.length === 0 ? (
+                  <div className="directory-meta">No visits scheduled yet for this assignment.</div>
+                ) : (
+                  <div className="assignment-slot-list">
+                    {assignmentVisits.map((visit) => {
+                      const isFutureVisit = String(visit.scheduled_date || '') > new Date().toISOString().slice(0, 10);
+                      const visitAssignDraft = assignmentVisitAssignDraftsByVisit[visit.id] || {
+                        scheduled_date: visit.scheduled_date,
+                        start_time: '09:00',
+                      };
+                      return (
+                        <div key={`details-short-visit-${assignment.id}-${visit.id}`} className="assignment-slot-row">
+                          <label>
+                            Visit date
+                            <input
+                              className="small-input"
+                              type="date"
+                              value={visitAssignDraft.scheduled_date}
+                              onChange={(event) => setAssignmentVisitAssignDraftsByVisit((current) => ({
+                                ...current,
+                                [visit.id]: {
+                                  ...visitAssignDraft,
+                                  scheduled_date: event.target.value,
+                                },
+                              }))}
+                            />
+                          </label>
+                          <label>
+                            Start time
+                            <input
+                              className="small-input"
+                              type="time"
+                              value={visitAssignDraft.start_time}
+                              onChange={(event) => setAssignmentVisitAssignDraftsByVisit((current) => ({
+                                ...current,
+                                [visit.id]: {
+                                  ...visitAssignDraft,
+                                  start_time: event.target.value,
+                                },
+                              }))}
+                            />
+                          </label>
+                          <button type="button" className="btn btn-primary" onClick={() => void handleAssignVisitToSameBuddy(assignment, visit)}>
+                            Assign
+                          </button>
+                          {isFutureVisit && (
+                            <button type="button" className="btn btn-secondary" onClick={() => void handleReassignVisitBuddy(visit)}>
+                              Reassign buddy
+                            </button>
+                          )}
+                          <div className="directory-meta">{visit.visit_status || 'scheduled'} • Arrival: {visit.arrival_time || 'Not marked'} • Departure: {visit.departure_time || 'Not marked'}</div>
+                        </div>
+                      );
+                    })}
                   </div>
-                ))}
+                )}
               </div>
-              <div className="directory-actions">
-                <button type="button" className="btn btn-secondary" onClick={() => handleAddAssignmentSlotDraft(assignment)}>
-                  Add extra visit row
-                </button>
-                <button type="button" className="btn btn-primary" onClick={() => void handleSaveAssignmentSlots(assignment)}>
-                  Save slot changes
-                </button>
-              </div>
-            </div>
+            </>
           ) : (
             <div className="assignment-slot-editor">
               <div className="family-title">Long-term details and replacement</div>
@@ -4325,12 +4756,20 @@ function App() {
                 {assignmentVisits.length === 0 ? (
                   <div className="directory-meta">No visits scheduled yet for this assignment.</div>
                 ) : (
-                  assignmentVisits.map((visit) => (
-                    <div key={`details-long-visit-${assignment.id}-${visit.id}`} className="family-audit-item">
-                      <div className="status">{visit.scheduled_date || 'No date'} • {visit.visit_status || 'scheduled'}</div>
-                      <div className="meta">Arrival: {visit.arrival_time || 'Not marked'} • Departure: {visit.departure_time || 'Not marked'}</div>
-                    </div>
-                  ))
+                  assignmentVisits.map((visit) => {
+                    const isFutureVisit = String(visit.scheduled_date || '') > new Date().toISOString().slice(0, 10);
+                    return (
+                      <div key={`details-long-visit-${assignment.id}-${visit.id}`} className="family-audit-item">
+                        <div className="status">{visit.scheduled_date || 'No date'} • {visit.visit_status || 'scheduled'}</div>
+                        <div className="meta">Arrival: {visit.arrival_time || 'Not marked'} • Departure: {visit.departure_time || 'Not marked'}</div>
+                        {isFutureVisit && (
+                          <button type="button" className="btn btn-secondary" onClick={() => void handleReassignVisitBuddy(visit)}>
+                            Reassign buddy
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })
                 )}
               </div>
               <div className="family-form">
@@ -4557,6 +4996,147 @@ function App() {
           <div className="overlay-actions">
             <button type="button" className="btn btn-primary" onClick={() => setStatusMessage('')}>
               OK
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderVisitReassignmentModal = () => {
+    if (!visitReassignmentModal) {
+      return null;
+    }
+
+    const { visit } = visitReassignmentModal;
+    const availableBuddies = buddies.filter((buddy) => {
+      const isSameAsCurrentBuddy = Number(buddy.id) === Number(visit.buddy_id);
+      const isCurrentlyAssigned = activelyAssignedBuddyIds.has(Number(buddy.id));
+      return isSameAsCurrentBuddy || !isCurrentlyAssigned;
+    });
+
+    return (
+      <div
+        className="overlay-backdrop"
+        role="presentation"
+        onClick={() => setVisitReassignmentModal(null)}
+      >
+        <div
+          className="overlay-panel modal-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Reassign visit buddy"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <div className="overlay-header">
+            <h3 className="overlay-title">Reassign visit buddy</h3>
+          </div>
+          <div className="modal-body">
+            <div className="status">Visit: {visit.scheduled_date}</div>
+            <div className="status">Client: {visit.client_name}</div>
+            <div className="status">Current caretaker: {visit.buddy_name}</div>
+            <label>
+              Select new caretaker
+              <select
+                className="small-input"
+                value={visitReassignmentModal.selectedBuddyId}
+                onChange={(event) => setVisitReassignmentModal({ ...visitReassignmentModal, selectedBuddyId: event.target.value })}
+              >
+                <option value="">-- Select caretaker --</option>
+                {availableBuddies.map((buddy) => (
+                  <option key={`reassign-buddy-${buddy.id}`} value={buddy.id}>{buddy.name}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="overlay-actions">
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => setVisitReassignmentModal(null)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => void handleConfirmVisitReassignment()}
+            >
+              Reassign and create new assignment
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderBackfillConflictModal = () => {
+    if (!backfillConflictModal) {
+      return null;
+    }
+
+    const availableBuddies = buddies.filter((buddy) => {
+      return !activelyAssignedBuddyIds.has(Number(buddy.id));
+    });
+
+    return (
+      <div
+        className="overlay-backdrop"
+        role="presentation"
+        onClick={() => setBackfillConflictModal(null)}
+      >
+        <div
+          className="overlay-panel modal-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Backfill conflict resolution"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <div className="overlay-header">
+            <h3 className="overlay-title">Caregiver conflict on {backfillConflictModal.conflict_date}</h3>
+          </div>
+          <div className="modal-body">
+            <div className="status">The current caregiver has another assignment on {backfillConflictModal.conflict_date}.</div>
+            <div className="status">Backfill reason: {backfillConflictModal.backfill_reason}</div>
+            <div className="directory-meta" style={{ marginTop: '1rem' }}>
+              You can either:
+            </div>
+            <div className="family-form">
+              <label>
+                <strong>Option 1: Reassign to a different caretaker</strong>
+                <select
+                  className="small-input"
+                  value={backfillConflictModal.selectedReassignBuddyId}
+                  onChange={(event) => setBackfillConflictModal({ ...backfillConflictModal, selectedReassignBuddyId: event.target.value })}
+                >
+                  <option value="">-- Select caretaker --</option>
+                  {availableBuddies.map((buddy) => (
+                    <option key={`backfill-reassign-${buddy.id}`} value={buddy.id}>{buddy.name}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="directory-meta">Creates a new assignment for this caregiver on {backfillConflictModal.conflict_date}.</div>
+              <label>
+                <strong>Option 2: Auto-carry-forward</strong>
+                <div className="directory-meta">System will carry forward to the next available day when the original caregiver is free.</div>
+              </label>
+            </div>
+          </div>
+          <div className="overlay-actions">
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => void handleAutoCarryForward()}
+            >
+              Auto-carry-forward
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => void handleConfirmBackfillReassignment()}
+              disabled={!backfillConflictModal.selectedReassignBuddyId}
+            >
+              Reassign to selected caretaker
             </button>
           </div>
         </div>
@@ -5297,25 +5877,29 @@ function App() {
         </div>
         {renderStatusLegend()}
         <div className="card-grid assignment-card-grid">
-          {visibleAssignments.map((assignment) => (
-            <div key={assignment.id} className={`mini-card assignment-card assignment-card-${getAssignmentCardCategory(assignment)}`}>
-              <div className={getAssignmentCardTag(assignment).className}>{getAssignmentCardTag(assignment).label}</div>
-              <div className="name">{assignment.buddy_name || 'Unknown caretaker'}</div>
-              <div className="status">Client: {assignment.elderly_name || 'Unknown client'}</div>
-              <div className="status">{getAssignmentPlanSummary(assignment)}</div>
-              <div className="directory-actions assignment-card-actions">
-                <button className="btn btn-secondary" type="button" onClick={() => void handleAssignmentApprovalAction(assignment.id)}>
-                  Approve
-                </button>
-                <button className="btn btn-secondary" type="button" onClick={() => void handleDeleteAssignment(assignment.id)}>
-                  Delete
-                </button>
-                <button className="btn btn-secondary" type="button" onClick={() => openAssignmentDetails(assignment.id)}>
-                  More
-                </button>
+          {visibleAssignments.map((assignment) => {
+            const isApproved = (assignment.approval_state || 'pending_approval') === 'approved';
+
+            return (
+              <div key={assignment.id} className={`mini-card assignment-card assignment-card-${getAssignmentCardCategory(assignment)}`}>
+                <div className={getAssignmentCardTag(assignment).className}>{getAssignmentCardTag(assignment).label}</div>
+                <div className="name">{assignment.buddy_name || 'Unknown caretaker'}</div>
+                <div className="status">Client: {assignment.elderly_name || 'Unknown client'}</div>
+                <div className="status">{getAssignmentPlanSummary(assignment)}</div>
+                <div className="directory-actions assignment-card-actions">
+                  <button className="btn btn-secondary" type="button" onClick={() => void handleAssignmentApprovalAction(assignment.id)} disabled={isApproved}>
+                    {isApproved ? 'Approved' : 'Approve'}
+                  </button>
+                  <button className="btn btn-secondary" type="button" onClick={() => void handleDeleteAssignment(assignment.id)}>
+                    Delete
+                  </button>
+                  <button className="btn btn-secondary" type="button" onClick={() => openAssignmentDetails(assignment.id)}>
+                    More
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
         <div className="directory-meta">Open More on any assignment to view detailed approval and session history with scroll.</div>
       </div>}
@@ -5353,30 +5937,32 @@ function App() {
                 <div className="status">SLA overdue: {requestOpsMetrics.overdue_requests.length}</div>
               </div>
               {requestOpsMetrics.overdue_requests.length > 0 ? (
-                <table className="panel-table">
-                  <thead>
-                    <tr>
-                      <th>Created</th>
-                      <th>User</th>
-                      <th>Type</th>
-                      <th>Status</th>
-                      <th>Age</th>
-                      <th>SLA</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {requestOpsMetrics.overdue_requests.map((entry, index) => (
-                      <tr key={entry.id ?? `overdue-${index}`}>
-                        <td>{new Date(entry.timestamp).toLocaleString()}</td>
-                        <td>{entry.user_name || 'Unknown'}</td>
-                        <td>{entry.request_type}</td>
-                        <td>{entry.status}</td>
-                        <td>{entry.age_hours}h</td>
-                        <td>{entry.sla_target_hours ? `${entry.sla_target_hours}h` : '-'}</td>
+                <div className="table-scroll-wrap">
+                  <table className="panel-table panel-table-wide">
+                    <thead>
+                      <tr>
+                        <th>Created</th>
+                        <th>User</th>
+                        <th>Type</th>
+                        <th>Status</th>
+                        <th>Age</th>
+                        <th>SLA</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {requestOpsMetrics.overdue_requests.map((entry, index) => (
+                        <tr key={entry.id ?? `overdue-${index}`}>
+                          <td>{new Date(entry.timestamp).toLocaleString()}</td>
+                          <td>{entry.user_name || 'Unknown'}</td>
+                          <td>{entry.request_type}</td>
+                          <td>{entry.status}</td>
+                          <td>{entry.age_hours}h</td>
+                          <td>{entry.sla_target_hours ? `${entry.sla_target_hours}h` : '-'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               ) : (
                 <div className="status">No requests are currently over SLA.</div>
               )}
@@ -5384,7 +5970,7 @@ function App() {
             </>
           )}
         </div>
-        <table className="panel-table mobile-stack">
+        <table className="panel-table mobile-stack mobile-stack-centered">
           <thead>
             <tr>
               <th>Time</th>
@@ -5399,11 +5985,11 @@ function App() {
           <tbody>
             {requests.map((request, index) => (
               <tr key={request.id ?? `${request.user_id}-${index}`}>
-                <td>{new Date(request.timestamp).toLocaleString()}</td>
-                <td>{`${request.user_id} / ${request.user_name || 'Unknown'}`}</td>
-                <td>{request.request_type}</td>
-                <td>{request.message}</td>
-                <td>
+                <td data-label="Time">{new Date(request.timestamp).toLocaleString()}</td>
+                <td data-label="User">{`${request.user_id} / ${request.user_name || 'Unknown'}`}</td>
+                <td data-label="Type">{request.request_type}</td>
+                <td data-label="Message">{request.message}</td>
+                <td data-label="Assign to caretaker">
                   {request.request_type === 'task_request' && request.id ? (
                     (() => {
                       const effectiveRequestStatus = requestStatusEdits[request.id] || normalizeRequestStatusForUi(request.status);
@@ -5517,7 +6103,7 @@ function App() {
                     <span className="directory-meta">Request id missing</span>
                   )}
                 </td>
-                <td>
+                <td data-label="Status">
                   <select
                     className="small-input"
                     value={requestStatusEdits[request.id || 0] || normalizeRequestStatusForUi(request.status)}
@@ -5533,7 +6119,7 @@ function App() {
                     <option value="closed">closed</option>
                   </select>
                 </td>
-                <td>
+                <td data-label="Save">
                   <button
                     type="button"
                     className="btn btn-secondary"
@@ -5554,36 +6140,38 @@ function App() {
             <div className="directory-meta">No visit session history available yet.</div>
           ) : null}
           {!visitSessionHistoryLoading && visitSessionHistory.length > 0 ? (
-            <table className="panel-table">
-              <thead>
-                <tr>
-                  <th>Date</th>
-                  <th>Caregiver</th>
-                  <th>Client</th>
-                  <th>In</th>
-                  <th>Out</th>
-                  <th>Mode</th>
-                  <th>Reason</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visitSessionHistory.slice(0, 40).map((entry) => (
-                  <tr key={`session-history-${entry.id}`}>
-                    <td>{entry.session_date}</td>
-                    <td>{entry.buddy_name || 'Unknown'}</td>
-                    <td>{entry.client_name || 'Unknown'}</td>
-                    <td>{entry.intime ? new Date(entry.intime).toLocaleString() : 'Pending'}</td>
-                    <td>{entry.outtime ? new Date(entry.outtime).toLocaleString() : 'Pending'}</td>
-                    <td>
-                      <span className={entry.backfilled ? 'pill badge-upcoming' : 'pill badge-active'}>
-                        {entry.backfilled ? 'Backfilled' : 'Live'}
-                      </span>
-                    </td>
-                    <td>{entry.backfilled ? (entry.backfill_reason || 'No reason') : '-'}</td>
+            <div className="table-scroll-wrap">
+              <table className="panel-table panel-table-wide">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Caregiver</th>
+                    <th>Client</th>
+                    <th>In</th>
+                    <th>Out</th>
+                    <th>Mode</th>
+                    <th>Reason</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {visitSessionHistory.slice(0, 40).map((entry) => (
+                    <tr key={`session-history-${entry.id}`}>
+                      <td>{entry.session_date}</td>
+                      <td>{entry.buddy_name || 'Unknown'}</td>
+                      <td>{entry.client_name || 'Unknown'}</td>
+                      <td>{entry.intime ? new Date(entry.intime).toLocaleString() : 'Pending'}</td>
+                      <td>{entry.outtime ? new Date(entry.outtime).toLocaleString() : 'Pending'}</td>
+                      <td>
+                        <span className={entry.backfilled ? 'pill badge-upcoming' : 'pill badge-active'}>
+                          {entry.backfilled ? 'Backfilled' : 'Live'}
+                        </span>
+                      </td>
+                      <td>{entry.backfilled ? (entry.backfill_reason || 'No reason') : '-'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           ) : null}
         </div>
       </div>}
@@ -5718,7 +6306,7 @@ function App() {
             <div className="section">
               <div className="panel">
                 <h3>By mode</h3>
-                <table className="panel-table mobile-stack">
+                <table className="panel-table mobile-stack mobile-stack-centered">
                   <thead>
                     <tr>
                       <th>Mode</th>
@@ -5743,7 +6331,7 @@ function App() {
               </div>
               <div className="panel">
                 <h3>By visit status</h3>
-                <table className="panel-table mobile-stack">
+                <table className="panel-table mobile-stack mobile-stack-centered">
                   <thead>
                     <tr>
                       <th>Status</th>
@@ -5851,53 +6439,55 @@ function App() {
                   <div className="status">Requests: {archiveAnalyticsData.totals.requests}</div>
                   <div className="status">Lifecycle: {archiveAnalyticsData.totals.assignment_lifecycle}</div>
                 </div>
-                <table className="panel-table">
-                  <thead>
-                    <tr>
-                      <th>Month</th>
-                      <th>Assignments</th>
-                      <th>Visits</th>
-                      <th>Tasks</th>
-                      <th>Requests</th>
-                      <th>Lifecycle</th>
-                      <th>Trend</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {archiveTrendRows.map((entry) => {
-                      const monthTotal = entry.assignments + entry.visits + entry.tasks + entry.requests + entry.assignment_lifecycle;
-                      const trendWidthPercent = archiveTrendPeak > 0
-                        ? Math.max(6, Math.round((monthTotal / (archiveTrendPeak * 5)) * 100))
-                        : 0;
+                <div className="table-scroll-wrap">
+                  <table className="panel-table panel-table-wide">
+                    <thead>
+                      <tr>
+                        <th>Month</th>
+                        <th>Assignments</th>
+                        <th>Visits</th>
+                        <th>Tasks</th>
+                        <th>Requests</th>
+                        <th>Lifecycle</th>
+                        <th>Trend</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {archiveTrendRows.map((entry) => {
+                        const monthTotal = entry.assignments + entry.visits + entry.tasks + entry.requests + entry.assignment_lifecycle;
+                        const trendWidthPercent = archiveTrendPeak > 0
+                          ? Math.max(6, Math.round((monthTotal / (archiveTrendPeak * 5)) * 100))
+                          : 0;
 
-                      return (
-                        <tr key={entry.month}>
-                          <td>{formatArchiveMonthLabel(entry.month)}</td>
-                          <td>{entry.assignments}</td>
-                          <td>{entry.visits}</td>
-                          <td>{entry.tasks}</td>
-                          <td>{entry.requests}</td>
-                          <td>{entry.assignment_lifecycle}</td>
-                          <td>
-                            {monthTotal === 0 ? (
-                              <span className="directory-meta">No archived activity</span>
-                            ) : (
-                              <div
-                                style={{
-                                  height: '10px',
-                                  borderRadius: '999px',
-                                  background: 'linear-gradient(90deg, var(--primary), var(--accent))',
-                                  width: `${trendWidthPercent}%`,
-                                  minWidth: '12px',
-                                }}
-                              />
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                        return (
+                          <tr key={entry.month}>
+                            <td>{formatArchiveMonthLabel(entry.month)}</td>
+                            <td>{entry.assignments}</td>
+                            <td>{entry.visits}</td>
+                            <td>{entry.tasks}</td>
+                            <td>{entry.requests}</td>
+                            <td>{entry.assignment_lifecycle}</td>
+                            <td>
+                              {monthTotal === 0 ? (
+                                <span className="directory-meta">No archived activity</span>
+                              ) : (
+                                <div
+                                  style={{
+                                    height: '10px',
+                                    borderRadius: '999px',
+                                    background: 'linear-gradient(90deg, var(--primary), var(--accent))',
+                                    width: `${trendWidthPercent}%`,
+                                    minWidth: '12px',
+                                  }}
+                                />
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
                 <div className="directory-meta">Trend updated at {new Date(archiveAnalyticsData.generated_at).toLocaleString()}.</div>
               </>
             ) : null}
@@ -6117,15 +6707,13 @@ function App() {
             getActiveCaseVisits(visibleVisits).map((visit) => {
               const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
               const liveLocation = locationState?.currentLocation || null;
-              const locationText = liveLocation
-                ? `${liveLocation.lat}, ${liveLocation.lng} (live)`
-                : (visit.arrival_lat_lng || 'Map unavailable');
+              const distanceSummary = getDistanceSummaryForVisit(visit, liveLocation);
 
               return (
                 <div className="mini-card" key={`admin-active-map-${visit.id}`}>
                   <h3>{visit.buddy_name} → {visit.client_name}</h3>
                   <div className="status">Scheduled: {visit.scheduled_date}</div>
-                  <div className="directory-detail">Location: {locationText}</div>
+                  <div className="directory-detail">{distanceSummary.label}</div>
                   <div className="directory-detail">
                     {liveLocation
                       ? `Updated ${new Date(liveLocation.updated_at).toLocaleTimeString()}`
@@ -6136,89 +6724,90 @@ function App() {
             })
           )}
         </div>
-        {visibleVisits.some((visit) => {
-          const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
-          return Boolean(locationState?.guarded);
-        }) ? (
-          <div className="family-audit-list">
-            <div className="family-title">Map visibility guards</div>
-            {visibleVisits
-              .filter((visit) => {
+
+        <div className="table-scroll-wrap">
+          <table className="panel-table panel-table-wide">
+            <thead>
+              <tr>
+                <th>Caregiver</th>
+                <th>Client</th>
+                <th>Scheduled</th>
+                <th>Case state</th>
+                <th>Start</th>
+                <th>End</th>
+                <th>Location</th>
+                <th>Notes update</th>
+                <th>Visit state</th>
+                <th>Session</th>
+                <th>Save</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleVisits.map((visit) => {
                 const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
-                return Boolean(locationState?.guarded);
-              })
-              .map((visit) => {
-                const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
+                const liveLocation = locationState?.currentLocation || null;
+                const isActiveCase = getActiveCaseVisits([visit]).length > 0;
+                const distanceSummary = getDistanceSummaryForVisit(visit, liveLocation);
+                const displayLocation = locationState?.guarded
+                  ? getGuardReasonLabel(locationState.guard_reason_code, locationState.message)
+                  : isActiveCase
+                    ? distanceSummary.label
+                    : 'Map hidden (inactive case)';
+                const semanticVisitState = visitEdits[visit.id]?.visit_status || visit.visit_status || 'scheduled';
+                const sessionStarted = isVisitSessionStarted(visit);
+                const sessionClosed = isVisitSessionClosed(visit);
+
                 return (
-                  <div className="family-audit-item" key={`admin-guard-${visit.id}`}>
-                    <div className="meta">{visit.buddy_name} → {visit.client_name}</div>
-                    <div className="status">{getGuardReasonLabel(locationState?.guard_reason_code, locationState?.message)}</div>
-                  </div>
+                  <tr key={visit.id}>
+                    <td data-label="Caregiver">{visit.buddy_name}</td>
+                    <td data-label="Client">{visit.client_name}</td>
+                    <td data-label="Scheduled">{visit.scheduled_date}</td>
+                    <td data-label="Case state"><span className={getSemanticStatusClassName(semanticVisitState)}>{getSemanticStatusLabel(semanticVisitState)}</span></td>
+                    <td data-label="Start">{visit.arrival_time ? new Date(visit.arrival_time).toLocaleString() : 'Pending'}</td>
+                    <td data-label="End">{visit.departure_time ? new Date(visit.departure_time).toLocaleString() : 'Pending'}</td>
+                    <td data-label="Location">{displayLocation}</td>
+                    <td data-label="Notes update" className="visit-notes-cell">
+                      <textarea
+                        className="small-input"
+                        rows={3}
+                        value={visitEdits[visit.id]?.client_visible_notes ?? visit.client_visible_notes ?? ''}
+                        onChange={(event) => handleVisitEditChange(visit.id, 'client_visible_notes', event.target.value)}
+                        placeholder="Update for kin or mapped client"
+                      />
+                      <div className="directory-meta">Internal note: {visit.buddy_notes || 'None'}</div>
+                    </td>
+                    <td data-label="Visit state">
+                      <span className={getSemanticStatusClassName(semanticVisitState)}>{getSemanticStatusLabel(semanticVisitState)}</span>
+                      <select className="small-input" value={visitEdits[visit.id]?.visit_status || visit.visit_status || 'scheduled'} onChange={(event) => handleVisitEditChange(visit.id, 'visit_status', event.target.value)}>
+                        <option value="scheduled">scheduled</option>
+                        <option value="in_progress">in_progress</option>
+                        <option value="completed">completed</option>
+                        <option value="missed">missed</option>
+                        <option value="cancelled">cancelled</option>
+                      </select>
+                    </td>
+                    <td data-label="Session" className="visit-session-cell">
+                      <div className="directory-actions session-action-group">
+                        <button className="btn btn-secondary" type="button" onClick={() => void handleStartVisitSession(visit)} disabled={visit.scheduled_date !== new Date().toISOString().slice(0, 10) || sessionStarted || sessionClosed}>
+                          Start
+                        </button>
+                        <button className="btn btn-secondary" type="button" onClick={() => void handleCompleteVisitSession(visit)} disabled={visit.scheduled_date !== new Date().toISOString().slice(0, 10) || !sessionStarted || sessionClosed}>
+                          End
+                        </button>
+                        <button className="btn btn-secondary" type="button" onClick={() => void handleBackfillVisitSession(visit)} disabled={visit.scheduled_date !== new Date().toISOString().slice(0, 10) || !sessionStarted || sessionClosed}>
+                          Backfill
+                        </button>
+                      </div>
+                    </td>
+                    <td data-label="Save">
+                      <button className="btn btn-secondary" type="button" onClick={() => handleVisitAdminUpdate(visit.id)}>Save</button>
+                    </td>
+                  </tr>
                 );
               })}
-          </div>
-        ) : null}
-        <table className="panel-table">
-          <thead>
-            <tr>
-              <th>Caregiver</th>
-              <th>Client</th>
-              <th>Scheduled</th>
-              <th>Case state</th>
-              <th>Start</th>
-              <th>End</th>
-              <th>Location</th>
-              <th>Status</th>
-              <th>Notes</th>
-              <th>Visit state</th>
-              <th>Save</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visibleVisits.map((visit) => {
-              const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
-              const liveLocation = locationState?.currentLocation || null;
-              const isActiveCase = getActiveCaseVisits([visit]).length > 0;
-              const displayLocation = liveLocation
-                ? `${liveLocation.lat}, ${liveLocation.lng} (live)`
-                : locationState?.guarded
-                  ? getGuardReasonLabel(locationState.guard_reason_code, locationState.message)
-                : isActiveCase
-                  ? (visit.arrival_lat_lng || 'Map unavailable')
-                  : 'Map hidden (inactive case)';
-              const semanticVisitState = visitEdits[visit.id]?.visit_status || visit.visit_status || 'scheduled';
-
-              return (
-                <tr key={visit.id}>
-                  <td data-label="Caregiver">{visit.buddy_name}</td>
-                  <td data-label="Client">{visit.client_name}</td>
-                  <td data-label="Scheduled">{visit.scheduled_date}</td>
-                  <td data-label="Case state"><span className={getSemanticStatusClassName(semanticVisitState)}>{getSemanticStatusLabel(semanticVisitState)}</span></td>
-                  <td data-label="Start">{visit.arrival_time || 'Pending'}</td>
-                  <td data-label="End">{visit.departure_time || 'Pending'}</td>
-                  <td data-label="Location">{displayLocation}</td>
-                  <td data-label="Status">
-                    <input className="small-input" value={visitEdits[visit.id]?.status_check || ''} onChange={(event) => handleVisitEditChange(visit.id, 'status_check', event.target.value)} placeholder="Status check" />
-                  </td>
-                  <td data-label="Notes">{visit.buddy_notes || 'No notes'}</td>
-                  <td data-label="Visit state">
-                    <span className={getSemanticStatusClassName(semanticVisitState)}>{getSemanticStatusLabel(semanticVisitState)}</span>
-                    <select className="small-input" value={visitEdits[visit.id]?.visit_status || visit.visit_status || 'scheduled'} onChange={(event) => handleVisitEditChange(visit.id, 'visit_status', event.target.value)}>
-                      <option value="scheduled">scheduled</option>
-                      <option value="in_progress">in_progress</option>
-                      <option value="completed">completed</option>
-                      <option value="missed">missed</option>
-                      <option value="cancelled">cancelled</option>
-                    </select>
-                  </td>
-                  <td data-label="Save">
-                    <button className="btn btn-secondary" type="button" onClick={() => handleVisitAdminUpdate(visit.id)}>Save</button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+            </tbody>
+          </table>
+        </div>
       </div>}
     </>
   );
@@ -6264,7 +6853,7 @@ function App() {
                 <div className="mini-card" key={`client-approval-${assignment.id}`}>
                   <div className="name">{assignment.buddy_name} → {assignment.elderly_name}</div>
                   <div className="status">{getAssignmentPlanSummary(assignment)}</div>
-                  <div className="directory-detail">Admin note: {assignment.admin_notes || 'No note'}</div>
+                  <div className="directory-detail">Admin note: {stripClientCoordsTag(assignment.admin_notes) || 'No note'}</div>
                   <button
                     type="button"
                     className="btn btn-primary"
@@ -6304,15 +6893,11 @@ function App() {
         <div className="card-grid">
           {(() => {
             const activeCaseVisits = getActiveCaseVisits(visits);
-            const longTermAssignmentsWithoutActiveVisit = activeLongTermAssignments.filter((assignment) => (
-              !activeCaseVisits.some((visit) => Number(visit.assignment_id) === Number(assignment.id))
-            ));
-
-            if (activeCaseVisits.length === 0 && longTermAssignmentsWithoutActiveVisit.length === 0) {
+            if (activeCaseVisits.length === 0) {
               return (
             <div className="mini-card">
               <h3>No active case right now</h3>
-                  <div className="status">Location appears during active visit slots or when long-term case location data is available.</div>
+                  <div className="status">Location appears only after the caretaker starts the active visit session.</div>
             </div>
               );
             }
@@ -6322,15 +6907,13 @@ function App() {
                 {activeCaseVisits.map((visit) => {
               const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
               const liveLocation = locationState?.currentLocation || null;
-              const locationText = liveLocation
-                ? `${liveLocation.lat}, ${liveLocation.lng} (live)`
-                : (visit.arrival_lat_lng || 'Map unavailable');
+              const distanceSummary = getDistanceSummaryForVisit(visit, liveLocation);
 
               return (
                 <div className="mini-card" key={`client-active-map-${visit.id}`}>
                   <h3>{visit.buddy_name}</h3>
                   <div className="status">Scheduled: {visit.scheduled_date}</div>
-                  <div className="directory-detail">Location: {locationText}</div>
+                  <div className="directory-detail">{distanceSummary.label}</div>
                   <div className="directory-detail">
                     {liveLocation
                       ? `Updated ${new Date(liveLocation.updated_at).toLocaleTimeString()}`
@@ -6339,55 +6922,11 @@ function App() {
                 </div>
               );
                 })}
-                {longTermAssignmentsWithoutActiveVisit.map((assignment) => {
-                  const locationState = assignmentLocations[assignment.id] || null;
-                  const liveLocation = locationState?.currentLocation || null;
-                  const locationText = liveLocation
-                    ? `${liveLocation.lat}, ${liveLocation.lng} (live)`
-                    : locationState?.guarded
-                      ? getGuardReasonLabel(locationState.guard_reason_code, locationState.message)
-                      : 'Waiting for live update';
-
-                  return (
-                    <div className="mini-card" key={`client-active-map-long-${assignment.id}`}>
-                      <h3>{assignment.buddy_name}</h3>
-                      <div className="status">Long-term active case</div>
-                      <div className="directory-detail">Client: {assignment.elderly_name}</div>
-                      <div className="directory-detail">Location: {locationText}</div>
-                      <div className="directory-detail">
-                        {liveLocation
-                          ? `Updated ${new Date(liveLocation.updated_at).toLocaleTimeString()}`
-                          : 'Awaiting caretaker location refresh'}
-                      </div>
-                    </div>
-                  );
-                })}
               </>
             );
           })()}
         </div>
-        {visits.some((visit) => {
-          const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
-          return Boolean(locationState?.guarded);
-        }) ? (
-          <div className="family-audit-list">
-            <div className="family-title">Map visibility guards</div>
-            {visits
-              .filter((visit) => {
-                const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
-                return Boolean(locationState?.guarded);
-              })
-              .map((visit) => {
-                const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
-                return (
-                  <div className="family-audit-item" key={`client-guard-${visit.id}`}>
-                    <div className="meta">{visit.buddy_name} • {visit.scheduled_date}</div>
-                    <div className="status">{getGuardReasonLabel(locationState?.guard_reason_code, locationState?.message)}</div>
-                  </div>
-                );
-              })}
-          </div>
-        ) : null}
+
       </div>}
       {clientTab === 'visits' && <div className="panel">
         <h2>Current visits</h2>
@@ -6399,6 +6938,7 @@ function App() {
               <th>Scheduled</th>
               <th>Start</th>
               <th>Status</th>
+              <th>Notes update</th>
               <th>Location</th>
             </tr>
           </thead>
@@ -6407,12 +6947,11 @@ function App() {
               const locationState = visit.assignment_id ? assignmentLocations[visit.assignment_id] : null;
               const liveLocation = locationState?.currentLocation || null;
               const isActiveCase = getActiveCaseVisits([visit]).length > 0;
-              const displayLocation = liveLocation
-                ? `${liveLocation.lat}, ${liveLocation.lng} (live)`
-                : locationState?.guarded
-                  ? getGuardReasonLabel(locationState.guard_reason_code, locationState.message)
+              const distanceSummary = getDistanceSummaryForVisit(visit, liveLocation);
+              const displayLocation = locationState?.guarded
+                ? getGuardReasonLabel(locationState.guard_reason_code, locationState.message)
                 : isActiveCase
-                  ? (visit.arrival_lat_lng || 'Map unavailable')
+                  ? distanceSummary.label
                   : 'Map hidden (inactive case)';
 
               return (
@@ -6422,14 +6961,31 @@ function App() {
                   <td data-label="Start">{visit.arrival_time || 'Pending'}</td>
                   <td data-label="Status">
                     <span className={getSemanticStatusClassName(visit.visit_status || 'scheduled')}>{getSemanticStatusLabel(visit.visit_status || 'scheduled')}</span>
-                    <div className="directory-detail">{visit.status_check || 'Pending'}</div>
                   </td>
+                  <td data-label="Notes update">{visit.client_visible_notes || 'No care update yet.'}</td>
                   <td data-label="Location">{displayLocation}</td>
                 </tr>
               );
             })}
           </tbody>
         </table>
+      </div>}
+      {clientTab === 'visits' && <div className="panel">
+        <h2>Care updates</h2>
+        {visits.filter((visit) => String(visit.client_visible_notes || '').trim()).length === 0 ? (
+          <div className="status">No care updates shared yet.</div>
+        ) : (
+          <div className="family-audit-list">
+            {visits
+              .filter((visit) => String(visit.client_visible_notes || '').trim())
+              .map((visit) => (
+                <div key={`client-care-update-${visit.id}`} className="family-audit-item">
+                  <div className="meta">{visit.buddy_name} • {visit.scheduled_date}</div>
+                  <div className="status">{visit.client_visible_notes}</div>
+                </div>
+              ))}
+          </div>
+        )}
       </div>}
       {clientTab === 'requests' && <div className="panel">
         <h2>Request feedback or task support</h2>
@@ -6464,28 +7020,30 @@ function App() {
       </div>}
       {clientTab === 'requests' && <div className="panel">
         <h2>My request history</h2>
-        <table className="panel-table">
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>User</th>
-              <th>Type</th>
-              <th>Message</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {requests.map((request, index) => (
-              <tr key={request.id ?? `${request.user_id}-${index}`}>
-                <td>{new Date(request.timestamp).toLocaleString()}</td>
-                <td>{`${request.user_id} / ${request.user_name || 'Unknown'}`}</td>
-                <td>{request.request_type}</td>
-                <td>{request.message}</td>
-                <td>{getRequestStatusLabel(normalizeRequestStatusForUi(request.status))}</td>
+        <div className="table-scroll-wrap">
+          <table className="panel-table panel-table-wide">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>User</th>
+                <th>Type</th>
+                <th>Message</th>
+                <th>Status</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {requests.map((request, index) => (
+                <tr key={request.id ?? `${request.user_id}-${index}`}>
+                  <td>{new Date(request.timestamp).toLocaleString()}</td>
+                  <td>{`${request.user_id} / ${request.user_name || 'Unknown'}`}</td>
+                  <td>{request.request_type}</td>
+                  <td>{request.message}</td>
+                  <td>{getRequestStatusLabel(normalizeRequestStatusForUi(request.status))}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>}
     </>
   );
@@ -6566,52 +7124,65 @@ function App() {
       {buddyTab === 'visits' && <div className="panel">
         <h2>Visits</h2>
         {renderStatusLegend()}
-        <table className="panel-table">
-          <thead>
-            <tr>
-              <th>Client</th>
-              <th>Scheduled</th>
-              <th>Case state</th>
-              <th>Arrival</th>
-              <th>Status</th>
-              <th>Notes</th>
-              <th>Session</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visits.map((visit) => {
-              const semanticVisitState = visit.visit_status || 'scheduled';
-              const todaySession = visit.assignment_id ? getTodaySessionForAssignment(visit.assignment_id) : null;
-              return (
-                <tr key={visit.id}>
-                  <td data-label="Client">{visit.client_name}</td>
-                  <td data-label="Scheduled">{visit.scheduled_date}</td>
-                  <td data-label="Case state"><span className={getSemanticStatusClassName(semanticVisitState)}>{getSemanticStatusLabel(semanticVisitState)}</span></td>
-                  <td data-label="Arrival">{visit.arrival_time || 'Pending'}</td>
-                  <td data-label="Status">{visit.status_check || 'Pending'}</td>
-                  <td data-label="Notes">{visit.buddy_notes || 'None'}</td>
-                  <td data-label="Session">
-                    <div className="directory-actions">
-                      <button className="btn btn-secondary" type="button" onClick={() => void handleStartVisitSession(visit)}>
-                        Start
+        <div className="table-scroll-wrap">
+          <table className="panel-table panel-table-wide">
+            <thead>
+              <tr>
+                <th>Client</th>
+                <th>Scheduled</th>
+                <th>Case state</th>
+                <th>Arrival</th>
+                <th>Notes update</th>
+                <th>Session</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visits.map((visit) => {
+                const semanticVisitState = visit.visit_status || 'scheduled';
+                const todaySession = visit.assignment_id ? getTodaySessionForAssignment(visit.assignment_id) : null;
+                const sessionStarted = isVisitSessionStarted(visit);
+                const sessionClosed = isVisitSessionClosed(visit);
+                return (
+                  <tr key={visit.id}>
+                    <td data-label="Client">{visit.client_name}</td>
+                    <td data-label="Scheduled">{visit.scheduled_date}</td>
+                    <td data-label="Case state"><span className={getSemanticStatusClassName(semanticVisitState)}>{getSemanticStatusLabel(semanticVisitState)}</span></td>
+                    <td data-label="Arrival">{visit.arrival_time || 'Pending'}</td>
+                    <td data-label="Notes update" className="visit-notes-cell">
+                      <textarea
+                        className="small-input"
+                        rows={3}
+                        value={visitEdits[visit.id]?.client_visible_notes ?? visit.client_visible_notes ?? ''}
+                        onChange={(event) => handleVisitEditChange(visit.id, 'client_visible_notes', event.target.value)}
+                        placeholder="Update for kin or mapped client"
+                      />
+                      <button className="btn btn-secondary" type="button" onClick={() => handleVisitAdminUpdate(visit.id)}>
+                        Save note update
                       </button>
-                      <button className="btn btn-secondary" type="button" onClick={() => void handleCompleteVisitSession(visit)}>
-                        End
-                      </button>
-                      <button className="btn btn-secondary" type="button" onClick={() => void handleBackfillVisitSession(visit)}>
-                        Backfill
-                      </button>
-                      <div className="directory-meta">
-                        {todaySession?.intime ? `In ${new Date(todaySession.intime).toLocaleTimeString()}` : 'Not started'}
-                        {todaySession?.outtime ? ` / Out ${new Date(todaySession.outtime).toLocaleTimeString()}` : ''}
+                    </td>
+                    <td data-label="Session" className="visit-session-cell">
+                      <div className="directory-actions session-action-group">
+                        <button className="btn btn-secondary" type="button" onClick={() => void handleStartVisitSession(visit)} disabled={visit.scheduled_date !== new Date().toISOString().slice(0, 10) || sessionStarted || sessionClosed}>
+                          Start
+                        </button>
+                        <button className="btn btn-secondary" type="button" onClick={() => void handleCompleteVisitSession(visit)} disabled={visit.scheduled_date !== new Date().toISOString().slice(0, 10) || !sessionStarted || sessionClosed}>
+                          End
+                        </button>
+                        <button className="btn btn-secondary" type="button" onClick={() => void handleBackfillVisitSession(visit)} disabled={visit.scheduled_date !== new Date().toISOString().slice(0, 10) || !sessionStarted || sessionClosed}>
+                          Backfill
+                        </button>
+                        <div className="directory-meta">
+                          {todaySession?.intime ? `In ${new Date(todaySession.intime).toLocaleTimeString()}` : 'Not started'}
+                          {todaySession?.outtime ? ` / Out ${new Date(todaySession.outtime).toLocaleTimeString()}` : ''}
+                        </div>
                       </div>
-                    </div>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>}
     </>
   );
@@ -6661,6 +7232,8 @@ function App() {
       {renderAssignmentDetailsOverlay()}
       {renderClientAuditOverlay()}
       {renderCalendarDayDetailsOverlay()}
+      {renderVisitReassignmentModal()}
+      {renderBackfillConflictModal()}
       {renderStatusPopup()}
     </div>
   );

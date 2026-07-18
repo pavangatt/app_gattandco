@@ -1260,6 +1260,87 @@ button {
   color: var(--primary-dark);
 }
 
+.table-scroll-wrap {
+  margin-top: 12px;
+  max-height: 62vh;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: #fff;
+}
+
+.table-scroll-wrap .panel-table {
+  margin-top: 0;
+}
+
+.panel-table-wide {
+  min-width: 1180px;
+  table-layout: auto;
+  word-break: normal;
+}
+
+.panel-table-wide th,
+.panel-table-wide td {
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.panel-table-wide thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.panel-table-wide td:nth-child(7),
+.panel-table-wide td:nth-child(9) {
+  white-space: normal;
+  min-width: 220px;
+}
+
+.panel-table-wide td.visit-notes-cell {
+  min-width: 320px;
+  white-space: normal;
+}
+
+.panel-table-wide td.visit-session-cell {
+  min-width: 240px;
+  white-space: normal;
+}
+
+.panel-table-wide td .small-input,
+.panel-table-wide td .btn {
+  min-width: 120px;
+}
+
+.visit-notes-cell {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.visit-session-cell {
+  align-content: start;
+}
+
+.session-action-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  align-items: start;
+  justify-items: stretch;
+  margin-top: 0;
+}
+
+.session-action-group .btn {
+  width: 100%;
+  min-width: 0;
+}
+
+.session-action-group .directory-meta {
+  grid-column: 1 / -1;
+  white-space: normal;
+}
+
 .small-input {
   width: 100%;
   border: 1px solid var(--border);
@@ -1449,9 +1530,43 @@ textarea.small-input {
     margin-top: 0;
   }
 
+  .session-action-group {
+    grid-template-columns: 1fr;
+  }
+
   .panel-table.mobile-stack td .pill {
     margin-bottom: 8px;
     display: inline-flex;
+  }
+
+  .panel-table.mobile-stack.mobile-stack-centered td {
+    padding: 10px 8px;
+    text-align: center;
+  }
+
+  .panel-table.mobile-stack.mobile-stack-centered td::before {
+    display: block;
+    position: static;
+    width: auto;
+    margin-bottom: 6px;
+    text-align: center;
+  }
+
+  .panel-table.mobile-stack.mobile-stack-centered td .small-input,
+  .panel-table.mobile-stack.mobile-stack-centered td .btn {
+    width: min(100%, 380px);
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .panel-table.mobile-stack.mobile-stack-centered td .directory-meta,
+  .panel-table.mobile-stack.mobile-stack-centered td .status,
+  .panel-table.mobile-stack.mobile-stack-centered td .meta {
+    text-align: center;
+  }
+
+  .panel-table.mobile-stack.mobile-stack-centered td .family-form {
+    justify-items: center;
   }
 
   .calendar-weekdays {

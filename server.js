@@ -753,6 +753,22 @@ async function getActiveApprovedAssignmentForLocation(assignmentId) {
   } else if (normalizedStatus !== 'active') {
     guardReasonCode = 'inactive_assignment';
     guardMessage = 'Map is hidden because this assignment is not active.';
+  } else {
+    const { data: activeVisitRow, error: activeVisitError } = await supabase
+      .from('visits')
+      .select('id')
+      .eq('assignment_id', Number(assignmentId))
+      .eq('visit_status', 'in_progress')
+      .is('archived_at', null)
+      .order('scheduled_date', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    throwIfError(activeVisitError, 'Unable to validate active visit session for location access');
+
+    if (!activeVisitRow?.id) {
+      guardReasonCode = 'session_not_started';
+      guardMessage = 'Map is hidden until the visit session is started.';
+    }
   }
 
   const isActiveCase = !guardReasonCode;
@@ -763,6 +779,39 @@ async function getActiveApprovedAssignmentForLocation(assignmentId) {
     guardReasonCode,
     guardMessage,
   };
+}
+
+async function updateVisitFromSession(visitId, payload) {
+  if (!Number.isFinite(Number(visitId)) || Number(visitId) <= 0) {
+    return;
+  }
+
+  const effectivePayload = {};
+  if (payload.arrival_time !== undefined) effectivePayload.arrival_time = payload.arrival_time;
+  if (payload.departure_time !== undefined) effectivePayload.departure_time = payload.departure_time;
+  if (payload.visit_status !== undefined) effectivePayload.visit_status = payload.visit_status;
+  if (payload.status_check !== undefined) effectivePayload.status_check = payload.status_check;
+  if (payload.client_visible_notes !== undefined) effectivePayload.client_visible_notes = payload.client_visible_notes;
+
+  if (Object.keys(effectivePayload).length === 0) {
+    return;
+  }
+
+  const { error } = await supabase.from('visits').update(effectivePayload).eq('id', Number(visitId));
+  if (error) {
+    console.error(`Update visit ${visitId} failed:`, error);
+    console.error('Payload:', effectivePayload);
+    throwIfError(error, 'Unable to synchronize visit state from session');
+  }
+}
+
+function addDaysToDateOnly(value, offsetDays) {
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  parsed.setUTCDate(parsed.getUTCDate() + offsetDays);
+  return parsed.toISOString().slice(0, 10);
 }
 
 async function listClientContacts(clientId) {
@@ -1127,6 +1176,10 @@ async function ensureTask(visitId, taskName, status, measuredValue, buddyRemarks
   throwIfError(error, 'Unable to create task');
 }
 
+async function seedDefaultUsers() {
+  // Stub: seed default users if needed
+  // This can be extended to populate initial test data
+}
 
 async function initializeApp() {
   try {
@@ -3903,7 +3956,7 @@ app.put('/api/tasks/:id', async (req, res) => {
 });
 
 app.post('/api/location', async (req, res) => {
-  const { buddy_id, lat, lng } = req.body;
+  const { buddy_id, lat, lng, assignment_id } = req.body;
 
   if (!buddy_id || !lat || !lng) {
     return res.status(400).json({ message: 'Buddy ID, latitude, and longitude are required.' });
@@ -3914,28 +3967,25 @@ app.post('/api/location', async (req, res) => {
   currentLocations[String(buddy_id)] = { lat, lng, updated_at: updatedAt };
 
   try {
-    const { data: assignmentRows, error: assignmentRowsError } = await supabase
-      .from('assignments')
-      .select('id')
-      .eq('buddy_id', Number(buddy_id))
-      .eq('status', 'active')
-      .eq('approval_state', 'approved')
-      .is('archived_at', null)
-      .limit(1);
-    throwIfError(assignmentRowsError, 'Unable to validate active assignment for location update');
-
-    if (!Array.isArray(assignmentRows) || assignmentRows.length === 0) {
-      return res.status(400).json({ message: 'Location updates are allowed only for active approved cases.' });
-    }
-
-    const { data: rows, error: rowsError } = await supabase
+    let visitQuery = supabase
       .from('visits')
-      .select('id')
-      .eq('buddy_id', buddy_id)
+      .select('id, assignment_id')
+      .eq('buddy_id', Number(buddy_id))
+      .eq('visit_status', 'in_progress')
       .is('archived_at', null)
       .order('scheduled_date', { ascending: false })
       .limit(1);
-    throwIfError(rowsError, 'Unable to fetch latest visit for location');
+
+    if (Number.isFinite(Number(assignment_id)) && Number(assignment_id) > 0) {
+      visitQuery = visitQuery.eq('assignment_id', Number(assignment_id));
+    }
+
+    const { data: rows, error: rowsError } = await visitQuery;
+    throwIfError(rowsError, 'Unable to fetch active visit for location');
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({ message: 'Location updates are available only after the visit session starts.' });
+    }
 
     if (Array.isArray(rows) && rows.length > 0) {
       const visitId = rows[0].id;
@@ -4189,7 +4239,7 @@ app.post('/api/visit-sessions/start', async (req, res) => {
   try {
     const { data: assignmentRow, error: assignmentRowError } = await supabase
       .from('assignments')
-      .select('id, buddy_id, approval_state, status')
+      .select('id, buddy_id, elderly_id, approval_state, status')
       .eq('id', assignmentId)
       .single();
     throwIfError(assignmentRowError, 'Unable to load assignment for session start');
@@ -4234,6 +4284,14 @@ app.post('/api/visit-sessions/start', async (req, res) => {
         })
         .eq('id', existingSession.id);
       throwIfError(updateError, 'Unable to start visit session');
+
+      await updateVisitFromSession(visit_id ? Number(visit_id) : existingSession.visit_id, {
+        arrival_time: existingSession.intime || startTimeIso,
+        departure_time: null,
+        visit_status: 'in_progress',
+        status_check: 'Visit session started',
+      });
+
       return res.json({ message: 'Visit session started.', id: existingSession.id, session_date: sessionDate });
     }
 
@@ -4253,6 +4311,13 @@ app.post('/api/visit-sessions/start', async (req, res) => {
       .select('id')
       .single();
     throwIfError(insertError, 'Unable to create visit session');
+
+    await updateVisitFromSession(visit_id ? Number(visit_id) : null, {
+      arrival_time: startTimeIso,
+      departure_time: null,
+      visit_status: 'in_progress',
+      status_check: 'Visit session started',
+    });
 
     return res.json({ message: 'Visit session started.', id: insertedSession.id, session_date: sessionDate });
   } catch (error) {
@@ -4275,10 +4340,23 @@ app.post('/api/visit-sessions/:id/complete', async (req, res) => {
   try {
     const { data: sessionRow, error: sessionRowError } = await supabase
       .from('visit_sessions')
-      .select('id, assignment_id, visit_id, outtime')
+      .select('id, assignment_id, visit_id, intime, outtime')
       .eq('id', sessionId)
       .single();
     throwIfError(sessionRowError, 'Unable to load visit session for completion');
+
+    // Resolve visit_id if not stored on the session row
+    let resolvedVisitId = sessionRow.visit_id ? Number(sessionRow.visit_id) : null;
+    if (!resolvedVisitId) {
+      const sessionDate = sessionRow.intime ? new Date(sessionRow.intime).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
+      const { data: visitLookup } = await supabase
+        .from('visits')
+        .select('id')
+        .eq('assignment_id', sessionRow.assignment_id)
+        .eq('scheduled_date', sessionDate)
+        .maybeSingle();
+      resolvedVisitId = visitLookup?.id ? Number(visitLookup.id) : null;
+    }
 
     const { data: assignmentRow, error: assignmentRowError } = await supabase
       .from('assignments')
@@ -4309,15 +4387,25 @@ app.post('/api/visit-sessions/:id/complete', async (req, res) => {
       }
     }
 
+    const completedAt = new Date().toISOString();
     const { error: updateError } = await supabase
       .from('visit_sessions')
       .update({
-        outtime: new Date().toISOString(),
+        outtime: completedAt,
         exit_notes: String(exit_notes || '').trim(),
         updated_at: new Date().toISOString(),
       })
       .eq('id', sessionId);
     throwIfError(updateError, 'Unable to complete visit session');
+
+    await updateVisitFromSession(resolvedVisitId, {
+      arrival_time: sessionRow.intime || null,
+      departure_time: completedAt,
+      visit_status: 'completed',
+      status_check: 'Visit session completed',
+    });
+
+    delete currentLocations[String(assignmentRow.buddy_id)];
 
     return res.json({ message: 'Visit session completed.' });
   } catch (error) {
@@ -4352,14 +4440,14 @@ app.post('/api/visit-sessions/:id/backfill', async (req, res) => {
   try {
     const { data: sessionRow, error: sessionRowError } = await supabase
       .from('visit_sessions')
-      .select('id, assignment_id')
+      .select('id, assignment_id, visit_id, session_date')
       .eq('id', sessionId)
       .single();
     throwIfError(sessionRowError, 'Unable to load visit session for backfill');
 
     const { data: assignmentRow, error: assignmentRowError } = await supabase
       .from('assignments')
-      .select('id, buddy_id')
+      .select('id, buddy_id, elderly_id')
       .eq('id', sessionRow.assignment_id)
       .single();
     throwIfError(assignmentRowError, 'Unable to load assignment for backfill');
@@ -4371,6 +4459,24 @@ app.post('/api/visit-sessions/:id/backfill', async (req, res) => {
     const effectiveSessionDate = normalizeDateOnly(session_date, null);
     if (!effectiveSessionDate) {
       return res.status(400).json({ message: 'session_date is required for backfill.' });
+    }
+
+    // Resolve visit_id if not already set in session
+    let resolvedVisitId = sessionRow.visit_id;
+    if (!resolvedVisitId) {
+      const { data: visitRow, error: visitRowError } = await supabase
+        .from('visits')
+        .select('id')
+        .eq('assignment_id', Number(sessionRow.assignment_id))
+        .eq('scheduled_date', sessionRow.session_date || effectiveSessionDate)
+        .is('archived_at', null)
+        .maybeSingle();
+      throwIfError(visitRowError, 'Unable to resolve visit_id for backfill');
+      resolvedVisitId = visitRow?.id || null;
+    }
+
+    if (!resolvedVisitId) {
+      return res.status(400).json({ message: 'Unable to find visit record for backfill. Session visit_id must be linked.' });
     }
 
     const { error: updateError } = await supabase
@@ -4387,6 +4493,97 @@ app.post('/api/visit-sessions/:id/backfill', async (req, res) => {
       })
       .eq('id', sessionId);
     throwIfError(updateError, 'Unable to backfill visit session');
+
+    const nextSessionDate = addDaysToDateOnly(effectiveSessionDate, 1);
+    
+    // Check if caregiver has another assignment/visit on the next day (gap conflict)
+    const { data: nextDayVisits, error: nextDayVisitsError } = await supabase
+      .from('visits')
+      .select('id')
+      .eq('buddy_id', Number(assignmentRow.buddy_id))
+      .eq('scheduled_date', nextSessionDate)
+      .is('archived_at', null)
+      .limit(1);
+    throwIfError(nextDayVisitsError, 'Unable to check for caregiver conflicts on next day');
+
+    if (nextDayVisits && nextDayVisits.length > 0) {
+      // Caregiver has existing assignment on next day - offer reassignment option to frontend
+      // Return conflict info so frontend can ask user to reassign or auto-carry-forward
+      const { data: nextVisitDetail, error: nextVisitDetailError } = await supabase
+        .from('visits')
+        .select('id, assignment_id, buddy_id, elderly_id, scheduled_date, visit_status')
+        .eq('buddy_id', Number(assignmentRow.buddy_id))
+        .eq('scheduled_date', nextSessionDate)
+        .is('archived_at', null)
+        .maybeSingle();
+      throwIfError(nextVisitDetailError, 'Unable to fetch next-day visit details');
+
+      // Update current session with basic backfill info
+      await updateVisitFromSession(resolvedVisitId, {
+        arrival_time: intime || null,
+        departure_time: outtime || new Date().toISOString(),
+        status_check: 'Backfilled - awaiting next action for carry-forward',
+        client_visible_notes: `Backfilled: ${String(backfill_reason || '').trim()}`,
+      });
+
+      return res.json({
+        message: `Backfilled. Caregiver is busy on ${nextSessionDate}. Reassignment available.`,
+        conflict: true,
+        conflict_date: nextSessionDate,
+        next_visit_id: nextVisitDetail?.id || null,
+        next_assignment_id: nextVisitDetail?.assignment_id || null,
+        current_buddy_id: assignmentRow.buddy_id,
+        elderly_id: assignmentRow.elderly_id,
+        backfill_reason: String(backfill_reason || '').trim(),
+      });
+    }
+
+    // No conflict - proceed with normal carry-forward to next day
+    const carryForwardNote = `Carry forwarded to ${nextSessionDate || 'next day'}: ${String(backfill_reason || '').trim()}`;
+
+    await updateVisitFromSession(resolvedVisitId, {
+      arrival_time: intime || null,
+      departure_time: outtime || new Date().toISOString(),
+      status_check: nextSessionDate ? `Carry forwarded to ${nextSessionDate}` : 'Carry forwarded',
+      client_visible_notes: carryForwardNote,
+    });
+
+    if (resolvedVisitId && nextSessionDate) {
+      const { data: currentVisitRow, error: currentVisitError } = await supabase
+        .from('visits')
+        .select('id, assignment_id, buddy_id, elderly_id, buddy_notes, client_visible_notes')
+        .eq('id', Number(resolvedVisitId))
+        .single();
+      throwIfError(currentVisitError, 'Unable to load current visit for carry forward');
+
+      const { data: existingNextVisit, error: existingNextVisitError } = await supabase
+        .from('visits')
+        .select('id')
+        .eq('assignment_id', Number(sessionRow.assignment_id))
+        .eq('scheduled_date', nextSessionDate)
+        .is('archived_at', null)
+        .maybeSingle();
+      throwIfError(existingNextVisitError, 'Unable to check next-day carried-forward visit');
+
+      if (!existingNextVisit?.id) {
+        const { error: insertNextVisitError } = await supabase.from('visits').insert({
+          assignment_id: Number(sessionRow.assignment_id),
+          buddy_id: Number(currentVisitRow.buddy_id || assignmentRow.buddy_id),
+          elderly_id: Number(currentVisitRow.elderly_id || assignmentRow.elderly_id),
+          scheduled_date: nextSessionDate,
+          visit_status: 'scheduled',
+          arrival_time: null,
+          departure_time: null,
+          arrival_lat_lng: null,
+          status_check: `Carry forwarded from ${effectiveSessionDate}`,
+          buddy_notes: String(currentVisitRow.buddy_notes || '').trim(),
+          client_visible_notes: carryForwardNote,
+        });
+        throwIfError(insertNextVisitError, 'Unable to create carried-forward visit');
+      }
+    }
+
+    delete currentLocations[String(assignmentRow.buddy_id)];
 
     const reminderSettings = await getReminderSettingsMap();
     if (reminderSettings.backfilled_visit_notice) {
@@ -4436,6 +4633,282 @@ app.post('/api/visit-sessions/:id/backfill', async (req, res) => {
   } catch (error) {
     console.error('Backfill visit session failed:', error);
     return res.status(500).json({ message: error.message || 'Unable to backfill visit session.' });
+  }
+});
+
+app.post('/api/visits/reassign-buddy', async (req, res) => {
+  if (!ensureAdminOrBuddySession(req, res)) {
+    return;
+  }
+
+  const { visit_id, new_buddy_id, elderly_id } = req.body;
+
+  if (!visit_id || !new_buddy_id || !elderly_id) {
+    return res.status(400).json({ message: 'Missing required fields: visit_id, new_buddy_id, elderly_id.' });
+  }
+
+  try {
+    // Fetch the visit to be reassigned
+    const { data: visitRow, error: visitError } = await supabase
+      .from('visits')
+      .select('id, assignment_id, buddy_id, scheduled_date, elderly_id')
+      .eq('id', Number(visit_id))
+      .single();
+    throwIfError(visitError, 'Unable to fetch visit for reassignment');
+
+    if (!visitRow) {
+      return res.status(404).json({ message: 'Visit not found.' });
+    }
+
+    // Fetch current assignment
+    const { data: currentAssignment, error: currentAssignmentError } = await supabase
+      .from('assignments')
+      .select('id, buddy_id, elderly_id, start_date, end_date')
+      .eq('id', Number(visitRow.assignment_id))
+      .single();
+    throwIfError(currentAssignmentError, 'Unable to fetch current assignment');
+
+    // Create new assignment for new buddy with same elderly
+    const { data: newAssignment, error: newAssignmentError } = await supabase
+      .from('assignments')
+      .insert({
+        buddy_id: Number(new_buddy_id),
+        elderly_id: Number(elderly_id),
+        start_date: visitRow.scheduled_date,
+        end_date: currentAssignment?.end_date || null,
+        status: 'active',
+      })
+      .select('id')
+      .single();
+    throwIfError(newAssignmentError, 'Unable to create new assignment for reassigned visit');
+
+    // Update the visit with new buddy and assignment
+    const { error: updateVisitError } = await supabase
+      .from('visits')
+      .update({
+        buddy_id: Number(new_buddy_id),
+        assignment_id: Number(newAssignment.id),
+      })
+      .eq('id', Number(visit_id));
+    throwIfError(updateVisitError, 'Unable to update visit with new buddy');
+
+    // Fetch buddy and client info for notification
+    const buddyMap = await fetchUsersMapById([Number(new_buddy_id)]);
+    const elderlyMap = await fetchElderlyMapById([Number(elderly_id)]);
+    const newBuddyName = buddyMap[new_buddy_id]?.full_name || 'Caregiver';
+    const elderly = elderlyMap[elderly_id] || null;
+
+    if (elderly?.client_id) {
+      const clientMap = await fetchUsersMapById([elderly.client_id]);
+      const client = clientMap[elderly.client_id] || null;
+
+      if (client) {
+        const visitDate = new Date(visitRow.scheduled_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        const messagePreview = `Caregiver update: ${newBuddyName} will visit ${elderly.name || 'your loved one'} on ${visitDate}.`;
+
+        await createNotificationActionLogEntry({
+          clientId: client.id,
+          actorUserId: req.session.user?.id || null,
+          recipientRole: 'client',
+          recipientName: client.full_name || 'Client',
+          recipientPhone: client.phone || '',
+          channel: 'notify',
+          templateKey: 'buddy_reassignment_notice',
+          messagePreview,
+        });
+
+        if (String(client.phone || '').trim()) {
+          await createNotificationActionLogEntry({
+            clientId: client.id,
+            actorUserId: req.session.user?.id || null,
+            recipientRole: 'client',
+            recipientName: client.full_name || 'Client',
+            recipientPhone: client.phone || '',
+            channel: 'whatsapp',
+            templateKey: 'buddy_reassignment_notice',
+            messagePreview,
+          });
+        }
+      }
+    }
+
+    return res.json({ message: `Visit reassigned to ${newBuddyName}. New assignment created.`, newAssignmentId: newAssignment.id });
+  } catch (error) {
+    console.error('Reassign visit buddy failed:', error);
+    return res.status(500).json({ message: error.message || 'Unable to reassign visit buddy.' });
+  }
+});
+
+app.post('/api/backfill-reassign', async (req, res) => {
+  if (!ensureAdminOrBuddySession(req, res)) {
+    return;
+  }
+
+  const { conflict_date, new_buddy_id, elderly_id, backfill_reason } = req.body;
+
+  if (!conflict_date || !new_buddy_id || !elderly_id) {
+    return res.status(400).json({ message: 'Missing required fields: conflict_date, new_buddy_id, elderly_id.' });
+  }
+
+  try {
+    // Create new assignment for the conflicted date with the new caregiver
+    const { data: newAssignment, error: newAssignmentError } = await supabase
+      .from('assignments')
+      .insert({
+        buddy_id: Number(new_buddy_id),
+        elderly_id: Number(elderly_id),
+        start_date: conflict_date,
+        end_date: null,
+        status: 'active',
+        approval_state: 'approved',
+        term_type: 'short',
+        service_plan_type: 'short_term',
+      })
+      .select('id')
+      .single();
+    throwIfError(newAssignmentError, 'Unable to create rescheduled assignment');
+
+    // Create visit for the conflicted date with new caregiver
+    const { error: insertVisitError } = await supabase.from('visits').insert({
+      assignment_id: Number(newAssignment.id),
+      buddy_id: Number(new_buddy_id),
+      elderly_id: Number(elderly_id),
+      scheduled_date: conflict_date,
+      visit_status: 'scheduled',
+      arrival_time: null,
+      departure_time: null,
+      arrival_lat_lng: null,
+      status_check: 'Rescheduled to different caregiver',
+      client_visible_notes: `Rescheduled visit: ${backfill_reason || 'Care visit rescheduled with different caregiver'}`,
+    });
+    throwIfError(insertVisitError, 'Unable to create rescheduled visit');
+
+    // Fetch buddy and client info for notifications
+    const buddyMap = await fetchUsersMapById([Number(new_buddy_id)]);
+    const elderlyMap = await fetchElderlyMapById([Number(elderly_id)]);
+    const newBuddyName = buddyMap[new_buddy_id]?.full_name || 'Caregiver';
+    const elderly = elderlyMap[elderly_id] || null;
+
+    // Notify client and new caregiver
+    if (elderly?.client_id) {
+      const clientMap = await fetchUsersMapById([elderly.client_id]);
+      const client = clientMap[elderly.client_id] || null;
+
+      if (client) {
+        const visitDate = new Date(conflict_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        const messagePreview = `Visit rescheduled: ${newBuddyName} will visit on ${visitDate}. Reason: ${backfill_reason || 'Caregiver unavailability'}`;
+
+        await createNotificationActionLogEntry({
+          clientId: client.id,
+          actorUserId: req.session.user?.id || null,
+          recipientRole: 'client',
+          recipientName: client.full_name || 'Client',
+          recipientPhone: client.phone || '',
+          channel: 'notify',
+          templateKey: 'visit_rescheduled_notice',
+          messagePreview,
+        });
+
+        if (String(client.phone || '').trim()) {
+          await createNotificationActionLogEntry({
+            clientId: client.id,
+            actorUserId: req.session.user?.id || null,
+            recipientRole: 'client',
+            recipientName: client.full_name || 'Client',
+            recipientPhone: client.phone || '',
+            channel: 'whatsapp',
+            templateKey: 'visit_rescheduled_notice',
+            messagePreview,
+          });
+        }
+      }
+    }
+
+    // Notify new caregiver about assignment
+    const newBuddy = buddyMap[new_buddy_id] || null;
+    if (newBuddy) {
+      const visitDate = new Date(conflict_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      const messagePreview = `New assignment: Visit for ${elderly?.name || 'client'} on ${visitDate}.`;
+
+      await createNotificationActionLogEntry({
+        clientId: newBuddy.id,
+        actorUserId: req.session.user?.id || null,
+        recipientRole: 'buddy',
+        recipientName: newBuddy.full_name || 'Caregiver',
+        recipientPhone: newBuddy.phone || '',
+        channel: 'notify',
+        templateKey: 'new_assignment_notice',
+        messagePreview,
+      });
+
+      if (String(newBuddy.phone || '').trim()) {
+        await createNotificationActionLogEntry({
+          clientId: newBuddy.id,
+          actorUserId: req.session.user?.id || null,
+          recipientRole: 'buddy',
+          recipientName: newBuddy.full_name || 'Caregiver',
+          recipientPhone: newBuddy.phone || '',
+          channel: 'whatsapp',
+          templateKey: 'new_assignment_notice',
+          messagePreview,
+        });
+      }
+    }
+
+    return res.json({ 
+      message: `Visit rescheduled to ${newBuddyName} on ${conflict_date}. New assignment created.`,
+      newAssignmentId: newAssignment.id 
+    });
+  } catch (error) {
+    console.error('Backfill reassign failed:', error);
+    return res.status(500).json({ message: error.message || 'Unable to reassign backfilled visit.' });
+  }
+});
+
+app.post('/api/visits/assign-same-buddy', async (req, res) => {
+  if (!ensureAdminOrBuddySession(req, res)) {
+    return;
+  }
+
+  const { assignment_id, buddy_id, elderly_id, scheduled_date } = req.body;
+  const effectiveDate = normalizeDateOnly(scheduled_date, null);
+
+  if (!assignment_id || !buddy_id || !elderly_id || !effectiveDate) {
+    return res.status(400).json({ message: 'Missing required fields: assignment_id, buddy_id, elderly_id, scheduled_date.' });
+  }
+
+  try {
+    const { data: existingVisit, error: existingVisitError } = await supabase
+      .from('visits')
+      .select('id')
+      .eq('assignment_id', Number(assignment_id))
+      .eq('scheduled_date', effectiveDate)
+      .is('archived_at', null)
+      .maybeSingle();
+    throwIfError(existingVisitError, 'Unable to check existing visit for assignment');
+
+    if (existingVisit?.id) {
+      return res.status(409).json({ message: `A visit already exists on ${effectiveDate} for this assignment.` });
+    }
+
+    const { error: insertVisitError } = await supabase.from('visits').insert({
+      assignment_id: Number(assignment_id),
+      buddy_id: Number(buddy_id),
+      elderly_id: Number(elderly_id),
+      scheduled_date: effectiveDate,
+      visit_status: 'scheduled',
+      arrival_time: null,
+      departure_time: null,
+      arrival_lat_lng: null,
+      status_check: 'Assigned follow-up visit',
+      client_visible_notes: 'Follow-up visit assigned to same caregiver.',
+    });
+    throwIfError(insertVisitError, 'Unable to assign follow-up visit to same caregiver');
+
+    return res.json({ message: `Follow-up visit assigned on ${effectiveDate}.` });
+  } catch (error) {
+    console.error('Assign same buddy visit failed:', error);
+    return res.status(500).json({ message: error.message || 'Unable to assign follow-up visit.' });
   }
 });
 
