@@ -7214,9 +7214,6 @@ function App() {
             </label>
             {message && <div className="auth-message">{message}</div>}
             <button className="btn btn-primary auth-submit" type="submit">Login</button>
-            <div className="auth-note">
-              Default credentials: admin / 1234567890, buddy1 / 1234567890, client1 / 1234567890.
-            </div>
           </form>
         </div>
       </div>
