@@ -49,6 +49,27 @@ button {
   gap: 16px;
 }
 
+.connectivity-banner {
+  border-radius: 14px;
+  padding: 10px 14px;
+  margin: 0 0 16px;
+  font-weight: 700;
+  font-size: 0.92rem;
+  border: 1px solid var(--border);
+}
+
+.connectivity-banner.online {
+  background: #e9fbf6;
+  color: #0f7a66;
+  border-color: #b5f0e2;
+}
+
+.connectivity-banner.offline {
+  background: #fff4e8;
+  color: #a04b00;
+  border-color: #ffd9b4;
+}
+
 .brand {
   display: flex;
   align-items: center;

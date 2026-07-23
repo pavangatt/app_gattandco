@@ -51,6 +51,11 @@ type ApiUser = {
   address?: string;
 };
 
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+};
+
 type Visit = {
   id: number;
   assignment_id?: number | null;
@@ -694,6 +699,10 @@ function App() {
   const [purgeReady, setPurgeReady] = useState(false);
   const [notificationTemplateByClient, setNotificationTemplateByClient] = useState<Record<number, NotificationTemplateKey>>({});
   const [customNotificationMessageByClient, setCustomNotificationMessageByClient] = useState<Record<number, string>>({});
+  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+  const [installPromptAvailable, setInstallPromptAvailable] = useState(false);
+  const [isStandaloneInstalled, setIsStandaloneInstalled] = useState(false);
+  const [isOnline, setIsOnline] = useState<boolean>(window.navigator.onLine);
   const auditOverlayRef = useRef<HTMLDivElement | null>(null);
   const auditCloseButtonRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusedElementRef = useRef<HTMLElement | null>(null);
@@ -748,6 +757,46 @@ function App() {
   const CUSTOM_NOTIFICATION_STORAGE_KEY = 'gatt_custom_notification_messages_by_client';
 
   const getDashboardCacheKey = (activeUser: User) => `gatt_dashboard_${activeUser.role}_${activeUser.id}`;
+
+  useEffect(() => {
+    const inStandaloneMode = window.matchMedia('(display-mode: standalone)').matches
+      || ((window.navigator as Navigator & { standalone?: boolean }).standalone === true);
+    setIsStandaloneInstalled(inStandaloneMode);
+
+    const handleBeforeInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setDeferredInstallPrompt(event as BeforeInstallPromptEvent);
+      setInstallPromptAvailable(true);
+    };
+
+    const handleAppInstalled = () => {
+      setDeferredInstallPrompt(null);
+      setInstallPromptAvailable(false);
+      setIsStandaloneInstalled(true);
+      setStatusMessage('App installed successfully.');
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt as EventListener);
+    window.addEventListener('appinstalled', handleAppInstalled);
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt as EventListener);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -2254,6 +2303,28 @@ function App() {
       .forEach((key) => sessionStorage.removeItem(key));
     setMessage('You have been logged out.');
     setStatusMessage('');
+  };
+
+  const handleInstallApp = async () => {
+    if (!deferredInstallPrompt) {
+      setStatusMessage('Install option is not available on this device/browser yet.');
+      return;
+    }
+
+    try {
+      await deferredInstallPrompt.prompt();
+      const choice = await deferredInstallPrompt.userChoice;
+      setDeferredInstallPrompt(null);
+      setInstallPromptAvailable(false);
+
+      if (choice.outcome === 'accepted') {
+        setStatusMessage('App install accepted.');
+      } else {
+        setStatusMessage('App install dismissed.');
+      }
+    } catch {
+      setStatusMessage('Unable to open install prompt right now.');
+    }
   };
 
   const handleCreateUser = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -5235,11 +5306,22 @@ function App() {
       </div>
       <div className="nav-pills">
         <span className="pill status-neutral">{user?.role.toUpperCase()}</span>
+        {installPromptAvailable && !isStandaloneInstalled ? (
+          <button className="btn btn-secondary" onClick={() => void handleInstallApp()}>
+            Install App
+          </button>
+        ) : null}
         <button className="btn btn-secondary" onClick={handleLogout}>
           Logout
         </button>
       </div>
     </header>
+  );
+
+  const renderConnectivityBanner = () => (
+    <div className={`connectivity-banner ${isOnline ? 'online' : 'offline'}`} role="status" aria-live="polite">
+      {isOnline ? 'Online: live updates are active.' : 'Offline: using cached data where available.'}
+    </div>
   );
 
   const renderDashboardTabs = (items: Array<{ key: string; label: string }>, active: string, onChange: (key: string) => void) => (
@@ -7190,6 +7272,7 @@ function App() {
   if (!user) {
     return (
       <div className="wrap auth-wrap">
+        {renderConnectivityBanner()}
         <div className="auth-box">
           <div className="auth-header">
             <div>
@@ -7223,6 +7306,7 @@ function App() {
   return (
     <div className="wrap">
       {renderHeader()}
+      {renderConnectivityBanner()}
       {user.role === 'admin' && adminDashboard()}
       {user.role === 'client' && clientDashboard()}
       {user.role === 'buddy' && buddyDashboard()}
