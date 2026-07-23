@@ -5298,7 +5298,7 @@ function App() {
   const renderHeader = () => (
     <header className="topbar">
       <div className="brand">
-        <div className="brand-badge">G</div>
+        <img className="brand-badge" src="/logo/gatt-mark.svg" alt="Gatt & Co logo" />
         <div>
           <div>Gatt & Co</div>
           <div className="brand-subtitle">Care portal for {user?.role}</div>
@@ -7277,7 +7277,7 @@ function App() {
           <div className="auth-header">
             <div>
               <div className="brand">
-                <div className="brand-badge">G</div>
+                <img className="brand-badge" src="/logo/gatt-mark.svg" alt="Gatt & Co logo" />
                 <div>
                   <div>Gatt & Co</div>
                   <div className="brand-subtitle">Care access portal</div>
